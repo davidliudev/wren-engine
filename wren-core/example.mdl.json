@@ -1,0 +1,64 @@
+{
+  "catalog": "wren",
+  "schema": "test",
+  "models": [
+    {
+      "name": "customers",
+      "tableReference": "public.customers",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "isCalculated": false,
+          "notNull": true
+        },
+        {
+          "name": "name",
+          "type": "varchar",
+          "isCalculated": false,
+          "notNull": true
+        },
+        {
+          "name": "state",
+          "type": "varchar",
+          "isCalculated": false,
+          "notNull": false
+        }
+      ],
+      "primaryKey": "id"
+    },
+    {
+      "name": "orders",
+      "tableReference": "public.orders",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "isCalculated": false,
+          "notNull": true
+        },
+        {
+          "name": "customer_id",
+          "type": "integer",
+          "isCalculated": false,
+          "notNull": true
+        },
+        {
+          "name": "customer_state",
+          "type": "varchar",
+          "isCalculated": true,
+          "expression": "customers.state"
+        }
+      ],
+      "primaryKey": "id"
+    }
+  ],
+  "relationships": [
+    {
+      "name": "orders_customers",
+      "models": ["orders", "customers"],
+      "joinType": "INNER",
+      "condition": "orders.customer_id = customers.id"
+    }
+  ]
+}

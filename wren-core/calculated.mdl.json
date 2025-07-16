@@ -1,0 +1,52 @@
+{
+  "catalog": "wren",
+  "schema": "test",
+  "models": [
+    {
+      "name": "orders",
+      "tableReference": {
+        "schema": "public",
+        "table": "orders"
+      },
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer",
+          "isCalculated": false,
+          "notNull": true
+        },
+        {
+          "name": "customer_id",
+          "type": "integer",
+          "isCalculated": false,
+          "notNull": true
+        },
+        {
+          "name": "amount",
+          "type": "decimal",
+          "isCalculated": false,
+          "notNull": true
+        },
+        {
+          "name": "order_date",
+          "type": "date",
+          "isCalculated": false,
+          "notNull": true
+        },
+        {
+          "name": "amount_in_cents",
+          "type": "integer",
+          "isCalculated": true,
+          "expression": "amount * 100"
+        },
+        {
+          "name": "order_year",
+          "type": "integer",
+          "isCalculated": true,
+          "expression": "extract(year from order_date)"
+        }
+      ],
+      "primaryKey": "id"
+    }
+  ]
+}
