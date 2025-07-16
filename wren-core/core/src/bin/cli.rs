@@ -4,7 +4,7 @@ use std::fs;
 use std::sync::Arc;
 use wren_core::mdl::{self, AnalyzedWrenMDL};
 use wren_core::mdl::context::Mode;
-use wren_core_base::mdl::manifest::Manifest;
+use wren_core_base::mdl::manifest::{Manifest, DataSource};
 
 #[derive(Parser, Debug)]
 #[command(name = "wren-cli")]
@@ -21,6 +21,27 @@ struct Args {
     /// Optional session properties as key=value pairs
     #[arg(short, long, value_delimiter = ',')]
     properties: Option<Vec<String>>,
+
+    /// SQL dialect to use (bigquery, mysql, postgres, snowflake, mssql, trino, clickhouse, canner, datafusion, duckdb, oracle)
+    #[arg(short, long, default_value = "datafusion")]
+    dialect: String,
+}
+
+fn parse_dialect(dialect_str: &str) -> Result<DataSource, Box<dyn std::error::Error>> {
+    match dialect_str.to_lowercase().as_str() {
+        "bigquery" => Ok(DataSource::BigQuery),
+        "mysql" => Ok(DataSource::MySQL),
+        "postgres" | "postgresql" => Ok(DataSource::Postgres),
+        "snowflake" => Ok(DataSource::Snowflake),
+        "mssql" | "sqlserver" => Ok(DataSource::MSSQL),
+        "trino" => Ok(DataSource::Trino),
+        "clickhouse" => Ok(DataSource::Clickhouse),
+        "canner" => Ok(DataSource::Canner),
+        "datafusion" => Ok(DataSource::Datafusion),
+        "duckdb" => Ok(DataSource::DuckDB),
+        "oracle" => Ok(DataSource::Oracle),
+        _ => Err(format!("Unsupported dialect: {}. Supported dialects: bigquery, mysql, postgres, snowflake, mssql, trino, clickhouse, canner, datafusion, duckdb, oracle", dialect_str).into()),
+    }
 }
 
 #[tokio::main]
@@ -31,9 +52,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Parse command line arguments
     let args = Args::parse();
 
+    // Parse dialect parameter
+    let data_source = parse_dialect(&args.dialect)?;
+
     // Read MDL file
     let mdl_content = fs::read_to_string(&args.mdl)?;
-    let manifest: Manifest = serde_json::from_str(&mdl_content)?;
+    let mut manifest: Manifest = serde_json::from_str(&mdl_content)?;
+    
+    // Override the data source with the CLI parameter
+    manifest.data_source = Some(data_source);
 
     // Parse session properties
     let mut session_props = HashMap::new();
