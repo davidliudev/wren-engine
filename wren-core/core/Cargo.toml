@@ -11,6 +11,7 @@ authors = { workspace = true }
 [lib]
 name = "wren_core"
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "wren-cli"
