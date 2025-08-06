@@ -337,3 +337,269 @@ pub extern "C" fn wren_validate_sql(
         Err(_) => std::ptr::null_mut(),
     }
 }
+
+/// Extracts the output schema from a SQL query
+/// Returns a JSON string with the schema information including column names and types
+async fn extract_sql_output_schema_internal(
+    schema_json: Option<&str>,
+    sql: &str,
+    _dialect_str: &str,
+    suggested_table_name: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    use datafusion::execution::context::SessionContext;
+    use datafusion::datasource::empty::EmptyTable;
+    use datafusion::arrow::datatypes::{Schema as ArrowSchema, Field as ArrowField, DataType};
+    
+    // Create a SessionContext
+    let ctx = SessionContext::new();
+    
+    // If schema is provided, register tables
+    if let Some(schema_str) = schema_json {
+        let schema_tables: Vec<serde_json::Value> = serde_json::from_str(schema_str)?;
+        
+        for table in &schema_tables {
+            if let Some(table_name) = table.get("tableName").and_then(|v| v.as_str()) {
+                // Create Arrow schema from table columns
+                let mut fields = Vec::new();
+                if let Some(columns) = table.get("columns").and_then(|v| v.as_array()) {
+                    for column in columns {
+                        if let Some(col_name) = column.get("name").and_then(|v| v.as_str()) {
+                            // Map column types to Arrow DataType
+                            let data_type = if let Some(col_type) = column.get("type").and_then(|v| v.as_str()) {
+                                match col_type.to_lowercase().as_str() {
+                                    "int" | "integer" | "int4" => DataType::Int32,
+                                    "bigint" | "int8" => DataType::Int64,
+                                    "smallint" | "int2" => DataType::Int16,
+                                    "float" | "real" | "float4" => DataType::Float32,
+                                    "double" | "float8" | "double precision" => DataType::Float64,
+                                    "boolean" | "bool" => DataType::Boolean,
+                                    "date" => DataType::Date32,
+                                    "timestamp" | "datetime" => DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Microsecond, None),
+                                    "decimal" | "numeric" => DataType::Decimal128(38, 10),
+                                    "varchar" | "text" | "string" => DataType::Utf8,
+                                    _ => DataType::Utf8, // Default to string
+                                }
+                            } else {
+                                DataType::Utf8
+                            };
+                            
+                            let nullable = column.get("nullable")
+                                .and_then(|v| v.as_bool())
+                                .unwrap_or(true);
+                            
+                            fields.push(ArrowField::new(col_name, data_type, nullable));
+                        }
+                    }
+                }
+                
+                // If no columns defined, create a dummy schema
+                if fields.is_empty() {
+                    fields.push(ArrowField::new("dummy", DataType::Utf8, true));
+                }
+                
+                let arrow_schema = Arc::new(ArrowSchema::new(fields.clone()));
+                let empty_table = EmptyTable::new(arrow_schema);
+                
+                // Register the table
+                let _ = ctx.register_table(table_name, Arc::new(empty_table));
+                
+                // Also register with schema prefix if available
+                if let Some(schema) = table.get("schema").and_then(|v| v.as_str()) {
+                    let qualified_name = format!("{}.{}", schema, table_name);
+                    let arrow_schema = Arc::new(ArrowSchema::new(fields));
+                    let empty_table = EmptyTable::new(arrow_schema);
+                    let _ = ctx.register_table(&qualified_name, Arc::new(empty_table));
+                }
+            }
+        }
+    }
+    
+    // Parse SQL to extract alias using DataFusion's parser
+    let extracted_table_name = extract_table_alias_from_parsed_sql(sql)
+        .or_else(|| suggested_table_name.map(|s| s.to_string()))
+        .unwrap_or_else(|| "query_result".to_string());
+    
+    // Create logical plan to extract schema
+    let logical_plan = ctx.state().create_logical_plan(sql).await?;
+    let schema = logical_plan.schema();
+    
+    // Convert schema to JSON format
+    let mut columns = Vec::new();
+    for field in schema.fields() {
+        let col_type = match field.data_type() {
+            DataType::Int8 | DataType::Int16 => "integer",
+            DataType::Int32 => "integer",
+            DataType::Int64 => "bigint",
+            DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => "bigint",
+            DataType::Float32 => "float",
+            DataType::Float64 => "double",
+            DataType::Boolean => "boolean",
+            DataType::Utf8 | DataType::LargeUtf8 => "varchar",
+            DataType::Date32 | DataType::Date64 => "date",
+            DataType::Timestamp(_, _) => "timestamp",
+            DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "decimal",
+            DataType::Binary | DataType::LargeBinary => "binary",
+            _ => "varchar", // Default to varchar for unknown types
+        };
+        
+        columns.push(serde_json::json!({
+            "name": field.name(),
+            "type": col_type,
+            "nullable": field.is_nullable(),
+        }));
+    }
+    
+    let result = serde_json::json!({
+        "success": true,
+        "tableName": extracted_table_name,
+        "columns": columns,
+    });
+    
+    Ok(result.to_string())
+}
+
+/// Helper function to extract table alias from parsed SQL using DataFusion's parser
+fn extract_table_alias_from_parsed_sql(sql: &str) -> Option<String> {
+    use datafusion::sql::parser::{DFParser, Statement};
+    
+    // Parse the SQL statement
+    let statements = match DFParser::parse_sql(sql) {
+        Ok(stmts) => stmts,
+        Err(_) => return None,
+    };
+    
+    // We only care about the first statement
+    let statement = statements.front()?;
+    
+    // Extract alias from the statement
+    match statement {
+        Statement::Statement(stmt) => {
+            match stmt.as_ref() {
+                datafusion::sql::sqlparser::ast::Statement::Query(query) => extract_alias_from_query(query),
+                _ => None,
+            }
+        },
+        _ => None,
+    }
+}
+
+/// Helper function to extract alias from a parsed query
+fn extract_alias_from_query(query: &Box<datafusion::sql::sqlparser::ast::Query>) -> Option<String> {
+    use datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
+    
+    // Check if the query itself has an alias (for subqueries used as tables)
+    // This would be in the FROM clause of an outer query
+    
+    match query.body.as_ref() {
+        SetExpr::Select(select) => {
+            // Only extract alias if there's exactly one table (no joins)
+            // Check if there's only one FROM table and no joins
+            if select.from.len() == 1 {
+                if let Some(table_with_joins) = select.from.first() {
+                    // Check if this table has any joins
+                    if table_with_joins.joins.is_empty() {
+                        // No joins, so we can extract the alias from the single table
+                        match &table_with_joins.relation {
+                            TableFactor::Derived { alias, .. } => {
+                                // Subquery with alias: SELECT * FROM (SELECT ...) AS alias
+                                if let Some(alias) = alias {
+                                    return Some(alias.name.value.clone());
+                                }
+                            }
+                            TableFactor::Table { alias, .. } => {
+                                // Regular table with alias: SELECT * FROM users u
+                                if let Some(alias) = alias {
+                                    return Some(alias.name.value.clone());
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // For JOINs or multiple tables, don't extract alias
+        }
+        _ => {}
+    }
+    
+    None
+}
+
+/// FFI function to extract output schema from SQL query
+/// Returns a JSON string with schema information
+/// suggested_table_name: optional suggested name for the output table (SQL alias takes precedence)
+#[no_mangle]
+pub extern "C" fn wren_extract_sql_schema(
+    schema_json: *const c_char,
+    sql: *const c_char,
+    dialect: *const c_char,
+    suggested_table_name: *const c_char,
+) -> *mut c_char {
+    if sql.is_null() || dialect.is_null() {
+        return std::ptr::null_mut();
+    }
+    
+    let schema_json_str = if schema_json.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(schema_json) }.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => return std::ptr::null_mut(),
+        }
+    };
+    
+    let sql_str = match unsafe { CStr::from_ptr(sql) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    let dialect_str = match unsafe { CStr::from_ptr(dialect) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    let suggested_table_name_str = if suggested_table_name.is_null() {
+        None
+    } else {
+        match unsafe { CStr::from_ptr(suggested_table_name) }.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => None,
+        }
+    };
+    
+    // Create a new Tokio runtime for this operation
+    let rt = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    
+    let result = rt.block_on(async {
+        extract_sql_output_schema_internal(
+            schema_json_str,
+            sql_str,
+            dialect_str,
+            suggested_table_name_str,
+        ).await
+    });
+    
+    match result {
+        Ok(schema_result) => {
+            match CString::new(schema_result) {
+                Ok(c_string) => c_string.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+        Err(e) => {
+            // Return error as JSON
+            let error_result = serde_json::json!({
+                "success": false,
+                "error": e.to_string(),
+            }).to_string();
+            
+            match CString::new(error_result) {
+                Ok(c_string) => c_string.into_raw(),
+                Err(_) => std::ptr::null_mut(),
+            }
+        }
+    }
+}
