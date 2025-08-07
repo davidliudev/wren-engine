@@ -331,10 +331,11 @@ function validateExpressionScope(expression, isCalculated, model, manifest) {
       }
       
       // Check if column exists in the physical table
-      if (!model.tableReference) {
+      // Note: Currently only tableReference is supported. refSql exists but is not implemented.
+      if (!model.tableReference || model.tableReference === '') {
         return {
           valid: false,
-          error: 'Model must have tableReference for source-level expressions'
+          error: 'Model must have tableReference for source-level expressions (refSql is not currently supported)'
         };
       }
       
