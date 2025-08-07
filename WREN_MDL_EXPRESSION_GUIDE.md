@@ -8,9 +8,9 @@ The `expression` field in Wren MDL is used to define SQL expressions for columns
 
 ### Three Types of Columns
 
-1. **Physical Column**: Direct database column mapping (no expression)
+1. **Physical Column**: Direct database column mapping (`isCalculated: false/omitted`, no expression)
 2. **Source-Level Expression**: SQL expression evaluated during table scan (`isCalculated: false` with expression)
-3. **Calculated Column**: Computed value in separate layer (`isCalculated: true` with expression)
+3. **Calculated Column**: Computed value in separate layer (`isCalculated: true` with expression - **expression is REQUIRED**)
 
 ### Important Discovery (Verified by Testing)
 
@@ -117,6 +117,17 @@ Wren's powerful feature allowing traversal through defined relationships using d
 | Array operations | `name: "first_tag"`<br>`isCalculated: true`<br>`expression: "tags[1]"` | Array element access |
 | Regular expression | `name: "phone_area_code"`<br>`isCalculated: true`<br>`expression: "regexp_substr(phone, '^\\d{3}')"` | Extract pattern with regex |
 
+## Valid Column Configurations
+
+### Summary of Valid Combinations
+
+| isCalculated | expression | Result | Example |
+|--------------|------------|--------|---------|
+| omitted/false | absent | Physical column (direct mapping) | `{"name": "id", "type": "integer"}` |
+| false | present | Source-level expression | `{"name": "id_upper", "type": "varchar", "isCalculated": false, "expression": "upper(id)"}` |
+| true | present | Calculated column | `{"name": "full_name", "type": "varchar", "isCalculated": true, "expression": "first_name \|\| ' ' \|\| last_name"}` |
+| true | absent | ❌ INVALID | Expression is required when isCalculated is true |
+
 ## Complete Model Example
 
 ```json
@@ -131,11 +142,10 @@ Wren's powerful feature allowing traversal through defined relationships using d
         "table": "raw_orders"
       },
       "columns": [
-        // Direct physical column (no expression)
+        // Case 1: Direct physical column (no expression, isCalculated false/omitted)
         {
           "name": "id",
           "type": "integer",
-          "isCalculated": false,
           "notNull": true
         },
         
@@ -246,7 +256,7 @@ This section provides comprehensive validation rules for implementing expression
 interface ColumnValidation {
   name: string;           // Required, must be valid identifier
   type: string;           // Required, must be valid SQL type
-  expression?: string;    // Optional
+  expression?: string;    // Optional when isCalculated is false; REQUIRED when isCalculated is true
   isCalculated?: boolean; // Optional, defaults to false
   notNull?: boolean;      // Optional
   relationship?: string;  // Optional, mutually exclusive with expression
@@ -257,7 +267,9 @@ interface ColumnValidation {
 - `name` must be a valid SQL identifier (alphanumeric + underscore, not starting with number)
 - `type` must be a supported SQL data type
 - If `relationship` is present, `expression` should NOT be present (they're mutually exclusive)
-- If `expression` is present, it must be a non-empty string
+- **Expression requirement depends on isCalculated:**
+  - If `isCalculated: true` → `expression` is REQUIRED (cannot be empty)
+  - If `isCalculated: false` or omitted → `expression` is OPTIONAL (can be absent for direct column mapping)
 
 #### 2. Expression Syntax Validation
 
@@ -459,12 +471,20 @@ function validateColumnExpression(column, model, manifest) {
     return { valid: false, errors: ['Column must have name and type'] };
   }
   
-  // 2. No expression? Valid (physical column)
-  if (!column.expression) {
+  // 2. Check expression requirement based on isCalculated
+  if (column.isCalculated === true && !column.expression) {
+    return { 
+      valid: false, 
+      errors: ['Expression is required when isCalculated is true'] 
+    };
+  }
+  
+  // 3. No expression and not calculated? Valid (physical column)
+  if (!column.expression && !column.isCalculated) {
     return { valid: true };
   }
   
-  // 3. Relationship columns shouldn't have expressions
+  // 4. Relationship columns shouldn't have expressions
   if (column.relationship && column.expression) {
     return { 
       valid: false, 
@@ -472,13 +492,13 @@ function validateColumnExpression(column, model, manifest) {
     };
   }
   
-  // 4. Validate expression syntax
+  // 5. Validate expression syntax
   const syntaxValidation = validateExpressionSyntax(column.expression, column.isCalculated);
   if (!syntaxValidation.valid) {
     validations.push(syntaxValidation.error);
   }
   
-  // 5. Validate scope
+  // 6. Validate scope
   const scopeValidation = validateExpressionScope(
     column.expression, 
     column.isCalculated, 
@@ -489,7 +509,7 @@ function validateColumnExpression(column, model, manifest) {
     validations.push(scopeValidation.error);
   }
   
-  // 6. Check circular dependencies (only for calculated)
+  // 7. Check circular dependencies (only for calculated)
   if (column.isCalculated) {
     const circularValidation = validateNoCircularDependencies(column, model);
     if (!circularValidation.valid) {
@@ -497,7 +517,7 @@ function validateColumnExpression(column, model, manifest) {
     }
   }
   
-  // 7. Validate type compatibility
+  // 8. Validate type compatibility
   const typeValidation = validateTypeCompatibility(column);
   if (!typeValidation.valid) {
     validations.push(typeValidation.error);
@@ -529,6 +549,7 @@ function validateColumnExpression(column, model, manifest) {
 
 ```javascript
 const ERROR_MESSAGES = {
+  EXPRESSION_REQUIRED: "Expression is required when isCalculated is true",
   EMPTY_EXPRESSION: "Expression cannot be empty",
   INVALID_SYNTAX: "Invalid SQL syntax in expression",
   RELATIONSHIP_IN_SOURCE: "Cannot use relationship navigation (e.g., customer.name) with isCalculated: false. Set isCalculated: true to use relationships.",
@@ -537,7 +558,8 @@ const ERROR_MESSAGES = {
   CIRCULAR_DEPENDENCY: "Circular dependency detected: {path}",
   TYPE_MISMATCH: "Expression returns {actual} but column type is {expected}",
   SUBQUERY_IN_SOURCE: "Subqueries not allowed in source-level expressions (isCalculated: false)",
-  AGGREGATION_WITHOUT_GROUP: "Aggregation functions require proper grouping context"
+  AGGREGATION_WITHOUT_GROUP: "Aggregation functions require proper grouping context",
+  BOTH_RELATIONSHIP_AND_EXPRESSION: "Column cannot have both relationship and expression fields"
 };
 ```
 
