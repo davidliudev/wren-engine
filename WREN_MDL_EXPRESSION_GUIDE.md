@@ -535,12 +535,13 @@ function validateColumnExpression(column, model, manifest) {
 
 | Validation Rule | isCalculated: false | isCalculated: true |
 |----------------|--------------------|--------------------|
-| **Can use column references** | ✅ Yes (same table only) | ✅ Yes (any visible column) |
+| **Can use column references** | ✅ Yes (physical columns from source table only) | ✅ Yes (physical columns from same model) |
 | **Can use SQL functions** | ✅ Yes | ✅ Yes |
 | **Can use arithmetic** | ✅ Yes | ✅ Yes |
 | **Can use CASE/COALESCE** | ✅ Yes | ✅ Yes |
 | **Can navigate relationships** | ❌ No | ✅ Yes |
-| **Can reference other calculated columns** | ❌ No | ✅ Yes |
+| **Can reference other calculated columns** | ❌ No | ❌ No (current limitation) |
+| **Can reference physical columns** | ✅ Yes (from source table) | ⚠️ Yes but has bugs when mixed with relationships |
 | **Can use aggregations** | ⚠️ Limited (no GROUP BY) | ✅ Yes |
 | **Can use window functions** | ⚠️ Database dependent | ✅ Yes |
 | **Can use subqueries** | ❌ No | ⚠️ Limited |
@@ -556,6 +557,8 @@ const ERROR_MESSAGES = {
   RELATIONSHIP_IN_SOURCE: "Cannot use relationship navigation (e.g., customer.name) with isCalculated: false. Set isCalculated: true to use relationships.",
   COLUMN_NOT_FOUND: "Column '{column}' not found in source table",
   INVALID_RELATIONSHIP: "Relationship '{relationship}' not defined in manifest",
+  CALCULATED_COLUMN_REFERENCE: "Calculated columns cannot reference other calculated columns. Consider using a view instead.",
+  MIXED_RELATIONSHIP_PHYSICAL: "Warning: Mixing relationship navigation with physical columns has known issues. Consider splitting into separate calculated columns.",
   CIRCULAR_DEPENDENCY: "Circular dependency detected: {path}",
   TYPE_MISMATCH: "Expression returns {actual} but column type is {expected}",
   SUBQUERY_IN_SOURCE: "Subqueries not allowed in source-level expressions (isCalculated: false)",
@@ -563,6 +566,41 @@ const ERROR_MESSAGES = {
   BOTH_RELATIONSHIP_AND_EXPRESSION: "Column cannot have both relationship and expression fields"
 };
 ```
+
+## Known Limitations and Bugs
+
+### Current Limitations (As of Code Analysis)
+
+1. **Calculated columns CANNOT reference other calculated columns**
+   - This is a fundamental limitation in the current implementation
+   - The schema for calculated expressions filters out other calculated columns
+   - Code reference: `/core/src/mdl/dataset.rs:65` - `.filter(|c| !c.is_calculated)`
+
+2. **Bug: Mixing relationships with physical columns in calculated expressions**
+   - Calculated columns have issues when combining relationship navigation with physical column references
+   - Example that doesn't work: `"Customers"."State" || ' ' || "Order_id"`
+   - Code reference: `/sqllogictest/src/test_context.rs:215` - TODO comment
+   - Workaround: Use separate calculated columns or views
+
+3. **No support for calculated columns without relationships in some cases**
+   - Some calculated expressions require relationship context to work properly
+   - Code reference: `/core/src/mdl/mod.rs:616` - TODO comment
+
+### Technical Explanation
+
+The limitations stem from how Wren processes calculated columns:
+1. Calculated columns are processed in a separate `CalculationPlanNode`
+2. This node creates a subquery with the calculation expression
+3. The subquery is joined back to the main query using the primary key
+4. The schema context differs between source-level and calculated expressions:
+   - Source-level uses `to_remote_schema()` which excludes calculated columns
+   - Calculated uses `to_qualified_schema()` which includes all physical columns but still can't reference other calculated columns due to processing order
+
+### Workarounds
+
+1. **For referencing calculated columns**: Create a view instead of using calculated columns
+2. **For mixing relationships with physical columns**: Split into multiple calculated columns
+3. **For complex calculations**: Consider using SQL views or materializing the calculations
 
 ## Code Reference
 
