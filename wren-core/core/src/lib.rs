@@ -78,36 +78,69 @@ async fn transform_sql_internal(
 }
 
 /// FFI function to transform SQL using Wren MDL
-/// Returns a C string that must be freed by the caller using free_string
+/// Returns a JSON C string that must be freed by the caller using free_string
+/// The JSON contains either success with result or error with details
 #[no_mangle]
 pub extern "C" fn wren_transform_sql(
     mdl_json: *const c_char,
     sql: *const c_char,
     dialect: *const c_char,
 ) -> *mut c_char {
+    // Helper function to create error response
+    fn create_error_response(error_type: &str, message: String, details: Option<String>) -> *mut c_char {
+        let response = serde_json::json!({
+            "success": false,
+            "result": null,
+            "error": {
+                "type": error_type,
+                "message": message,
+                "details": details.unwrap_or_default()
+            }
+        });
+        
+        match CString::new(response.to_string()) {
+            Ok(c_string) => c_string.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+    
+    // Helper function to create success response
+    fn create_success_response(result: String) -> *mut c_char {
+        let response = serde_json::json!({
+            "success": true,
+            "result": result,
+            "error": null
+        });
+        
+        match CString::new(response.to_string()) {
+            Ok(c_string) => c_string.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        }
+    }
+    
     if mdl_json.is_null() || sql.is_null() || dialect.is_null() {
-        return std::ptr::null_mut();
+        return create_error_response("input", "Invalid input: null pointer provided".to_string(), None);
     }
 
     let mdl_json_str = match unsafe { CStr::from_ptr(mdl_json) }.to_str() {
         Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => return create_error_response("input", "Invalid MDL JSON string encoding".to_string(), Some(e.to_string())),
     };
 
     let sql_str = match unsafe { CStr::from_ptr(sql) }.to_str() {
         Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => return create_error_response("input", "Invalid SQL string encoding".to_string(), Some(e.to_string())),
     };
 
     let dialect_str = match unsafe { CStr::from_ptr(dialect) }.to_str() {
         Ok(s) => s,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => return create_error_response("input", "Invalid dialect string encoding".to_string(), Some(e.to_string())),
     };
 
     // Create a new Tokio runtime for this operation
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
-        Err(_) => return std::ptr::null_mut(),
+        Err(e) => return create_error_response("runtime", "Failed to create async runtime".to_string(), Some(e.to_string())),
     };
 
     let result = rt.block_on(async {
@@ -115,13 +148,30 @@ pub extern "C" fn wren_transform_sql(
     });
 
     match result {
-        Ok(transformed_sql) => {
-            match CString::new(transformed_sql) {
-                Ok(c_string) => c_string.into_raw(),
-                Err(_) => std::ptr::null_mut(),
-            }
+        Ok(transformed_sql) => create_success_response(transformed_sql),
+        Err(e) => {
+            // Parse the error to determine type and extract meaningful message
+            let error_str = e.to_string();
+            
+            // Determine error type based on error message patterns
+            let (error_type, message, details) = if error_str.contains("Unsupported dialect") {
+                ("dialect", error_str.clone(), None)
+            } else if error_str.contains("MDL") || error_str.contains("manifest") || error_str.contains("JSON") {
+                ("mdl", "Invalid MDL structure".to_string(), Some(error_str))
+            } else if error_str.contains("SQL syntax") || error_str.contains("parse") {
+                ("syntax", "SQL parsing error".to_string(), Some(error_str))
+            } else if error_str.contains("column") || error_str.contains("Column") {
+                ("semantic", "Column reference error".to_string(), Some(error_str))
+            } else if error_str.contains("table") || error_str.contains("Table") || error_str.contains("model") || error_str.contains("Model") {
+                ("semantic", "Model/Table reference error".to_string(), Some(error_str))
+            } else if error_str.contains("relationship") || error_str.contains("Relationship") {
+                ("semantic", "Relationship error".to_string(), Some(error_str))
+            } else {
+                ("transformation", "SQL transformation failed".to_string(), Some(error_str))
+            };
+            
+            create_error_response(error_type, message, details)
         }
-        Err(_) => std::ptr::null_mut(),
     }
 }
 
