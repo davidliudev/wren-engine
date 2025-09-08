@@ -23,7 +23,11 @@ use datafusion::{
 use wren_core_base::mdl::RowLevelAccessControl;
 use wren_core_base::mdl::{Column, Model, SessionProperty};
 
-use crate::mdl::{context::SessionPropertiesRef, Dataset, SessionStateRef};
+use crate::{
+    logical_plan::utils::from_qualified_name,
+    mdl::{context::SessionPropertiesRef, Dataset, SessionStateRef},
+    AnalyzedWrenMDL,
+};
 
 /// Collect the required field from the condition of row level access control rules.
 pub fn collect_condition(
@@ -56,7 +60,10 @@ pub fn collect_condition(
                     spans: Spans::new(),
                 }));
             } else {
-                let session_property = value.trim_start_matches("@").to_string();
+                let session_property = value
+                    .trim_start_matches("@")
+                    .to_string()
+                    .to_ascii_lowercase();
                 if !session_properties.contains(&session_property) {
                     session_properties.insert(session_property);
                 }
@@ -83,7 +90,7 @@ pub fn validate_rlac_rule(rule: &RowLevelAccessControl, model: &Model) -> Result
     let RowLevelAccessControl {
         condition,
         required_properties,
-        ..
+        name,
     } = rule;
     let (_, session_properties) = collect_condition(model, condition)?;
 
@@ -98,12 +105,13 @@ pub fn validate_rlac_rule(rule: &RowLevelAccessControl, model: &Model) -> Result
         .collect();
     if !missed_properties.is_empty() {
         return plan_err!(
-            "The session property {} is used, but not found in the session properties",
+            "The session property {} is used for `{}` rule, but not found in the session properties",
             missed_properties
                 .iter()
                 .map(|property| format!("@{property}"))
                 .collect::<Vec<_>>()
-                .join(", ")
+                .join(", "),
+            name
         );
     }
     Ok(())
@@ -143,24 +151,27 @@ pub fn build_filter_expression(
                         .next()
                 }) else {
                     error = Some(plan_err!(
-                        "The session property {} is not found in the session properties",
-                        property_name
+                        "The session property {} is required for `{}` rule but not found in the session properties",
+                        property_name,
+                        rule.name
                     ));
                     return ControlFlow::Break(());
                 };
 
                 let Some(property_value) = property_value else {
                     error = Some(plan_err!(
-                        "The session property {} should not be null",
-                        property_name
+                        "The session property {} is required for `{}` rule and should not be null",
+                        property_name,
+                        rule.name
                     ));
                     return ControlFlow::Break(());
                 };
 
                 if property_value.trim().is_empty() {
                     error = Some(plan_err!(
-                        "The session property {} should not be empty",
-                        property_name
+                        "The session property {} is required for `{}` rule and should not be empty",
+                        property_name,
+                        rule.name
                     ));
                     return ControlFlow::Break(());
                 }
@@ -171,8 +182,9 @@ pub fn build_filter_expression(
                     }
                     Err(e) => {
                         error = Some(plan_err!(
-                            "The session property {} is not valid: {}",
+                            "The session property {} is required for `{}` rule but not valid: {}",
                             property_name,
+                            rule.name,
                             e
                         ));
                         return ControlFlow::Break(());
@@ -237,6 +249,7 @@ fn prevent_invalid_expr(expr: &ast::Expr) -> Result<()> {
 /// If the optional property is not found in the headers but has a default value, return true.
 /// If the optional property is not found in the headers and has no default value, return false.
 pub fn validate_rule(
+    name: &str,
     required_properties: &[SessionProperty],
     headers: &HashMap<String, Option<String>>,
 ) -> Result<bool> {
@@ -246,8 +259,9 @@ pub fn validate_rule(
             if property.required {
                 if !is_property_present(headers, &property.name) {
                     return plan_err!(
-                        "session property {} is required, but not found in headers",
-                        property.name
+                        "session property {} is required for `{}` rule but not found in headers",
+                        property.name,
+                        name
                     );
                 }
                 Ok(true)
@@ -271,37 +285,78 @@ pub fn validate_rule(
 }
 
 pub(crate) fn validate_clac_rule(
+    model_name: &str,
     column: &Column,
     properties: &SessionPropertiesRef,
-) -> Result<bool> {
-    let Some(clac) = column.column_level_access_control() else {
-        return Ok(true);
+    analyzed_mdl: Option<Arc<AnalyzedWrenMDL>>,
+) -> Result<(bool, Option<String>)> {
+    let (is_valid, rule_name) = if let Some(clac) = column.column_level_access_control() {
+        if !validate_rule(&clac.name, &clac.required_properties, properties)? {
+            return Ok((true, None));
+        }
+
+        if clac.required_properties.len() > 1 {
+            return plan_err!(
+                "Only support one required property for column access-control level rule: {}",
+                clac.name
+            );
+        }
+
+        let property = &clac.required_properties[0];
+        let value_opt = properties.get(&property.name);
+
+        match value_opt {
+            Some(Some(value)) => (clac.eval(value), Some(clac.name.clone())),
+            Some(None) | None => {
+                if let Some(default) = &property.default_expr {
+                    (clac.eval(default), Some(clac.name.clone()))
+                } else {
+                    (true, None)
+                }
+            }
+        }
+    } else {
+        (true, None)
     };
 
-    if !validate_rule(&clac.required_properties, properties)? {
-        return Ok(true);
-    }
-
-    if clac.required_properties.len() > 1 {
-        return plan_err!(
-            "Only support one required property for column access-control level rule: {}",
-            clac.name
-        );
-    }
-
-    let property = &clac.required_properties[0];
-    let value_opt = properties.get(&property.name);
-
-    match value_opt {
-        Some(Some(value)) => Ok(clac.eval(value)),
-        Some(None) | None => {
-            if let Some(default) = &property.default_expr {
-                Ok(clac.eval(default))
-            } else {
-                Ok(true)
+    if is_valid && column.is_calculated {
+        if let Some(analyzed_mdl) = analyzed_mdl {
+            let qualified_col =
+                from_qualified_name(&analyzed_mdl.wren_mdl, model_name, column.name());
+            let Some(required_fields) =
+                analyzed_mdl.lineage.required_fields_map.get(&qualified_col)
+            else {
+                return plan_err!("Required fields not found for {}", qualified_col);
+            };
+            for field in required_fields {
+                let Some(model_name) = &field.relation else {
+                    return plan_err!("Model name not found for {}", field);
+                };
+                let Some(ref_model) = analyzed_mdl.wren_mdl.get_model(model_name.table())
+                else {
+                    return plan_err!("Model {} not found", model_name.table());
+                };
+                let Some(ref_column) = ref_model.get_column(field.name()) else {
+                    return plan_err!(
+                        "Column {}.{} not found",
+                        model_name.table(),
+                        field.name()
+                    );
+                };
+                let (valid_result, rule_name) = validate_clac_rule(
+                    ref_model.name(),
+                    &ref_column,
+                    properties,
+                    Some(Arc::clone(&analyzed_mdl)),
+                )?;
+                if !valid_result {
+                    return Ok((false, rule_name));
+                }
             }
         }
     }
+
+    Ok((is_valid, rule_name))
 }
 
 /// Check if the property is present in the headers and not empty
@@ -385,42 +440,47 @@ mod test {
     pub fn test_validate_rule() -> Result<()> {
         // required property
         assert!(validate_rule(
+            "test",
             &[SessionProperty::new_required("session_id")],
             &build_headers(&[("session_id".to_string(), Some("1".to_string()))])
         )?);
 
         match validate_rule(
+            "test",
             &[SessionProperty::new_required("session_id")],
             &build_headers(&[("session_id".to_string(), None)]),
         ) {
             Err(error) => {
-                assert_snapshot!(error.message(), @"session property session_id is required, but not found in headers");
+                assert_snapshot!(error.message(), @"session property session_id is required for `test` rule but not found in headers");
             }
             _ => panic!("should be error"),
         }
 
         match validate_rule(
+            "test",
             &[SessionProperty::new_required("session_id")],
             &build_headers(&[("session_id".to_string(), Some("".to_string()))]),
         ) {
             Err(error) => {
-                assert_snapshot!(error.message(), @"session property session_id is required, but not found in headers");
+                assert_snapshot!(error.message(), @"session property session_id is required for `test` rule but not found in headers");
             }
             _ => panic!("should be error"),
         }
 
         match validate_rule(
+            "test",
             &[SessionProperty::new_required("session_id")],
             &build_headers(&[]),
         ) {
             Err(error) => {
-                assert_snapshot!(error.message(), @"session property session_id is required, but not found in headers");
+                assert_snapshot!(error.message(), @"session property session_id is required for `test` rule but not found in headers");
             }
             _ => panic!("should be error"),
         }
 
         // optional property with default
         assert!(validate_rule(
+            "test",
             &[SessionProperty::new_optional(
                 "session_id",
                 Some("1".to_string())
@@ -429,6 +489,7 @@ mod test {
         )?);
 
         assert!(validate_rule(
+            "test",
             &[SessionProperty::new_optional(
                 "session_id",
                 Some("1".to_string())
@@ -437,6 +498,7 @@ mod test {
         )?);
 
         assert!(validate_rule(
+            "test",
             &[SessionProperty::new_optional(
                 "session_id",
                 Some("1".to_string())
@@ -445,6 +507,7 @@ mod test {
         )?);
 
         assert!(validate_rule(
+            "test",
             &[SessionProperty::new_optional(
                 "session_id",
                 Some("1".to_string())
@@ -454,29 +517,34 @@ mod test {
 
         // optional property without default
         assert!(validate_rule(
+            "test",
             &[SessionProperty::new_optional("session_id", None)],
             &build_headers(&[("session_id".to_string(), Some("2".to_string()))])
         )?);
 
         // expected false
         assert!(!validate_rule(
+            "test",
             &[SessionProperty::new_optional("session_id", None)],
             &build_headers(&[("session_id".to_string(), None)])
         )?);
 
         // expected false
         assert!(!validate_rule(
+            "test",
             &[SessionProperty::new_optional("session_id", None)],
             &build_headers(&[("session_id".to_string(), Some("".to_string()))])
         )?);
 
         // expected false
         assert!(!validate_rule(
+            "test",
             &[SessionProperty::new_optional("session_id", None)],
             &build_headers(&[])
         )?);
 
         assert!(validate_rule(
+            "test",
             &[
                 SessionProperty::new_required("session_id"),
                 SessionProperty::new_optional("session_id_1", None),
@@ -491,6 +559,7 @@ mod test {
 
         // expected false
         assert!(!validate_rule(
+            "test",
             &[
                 SessionProperty::new_required("session_id"),
                 SessionProperty::new_optional("session_id_1", None),
@@ -504,6 +573,7 @@ mod test {
         )?);
 
         assert!(validate_rule(
+            "test",
             &[
                 SessionProperty::new_required("session_id"),
                 SessionProperty::new_optional("session_id_1", None),
@@ -517,6 +587,7 @@ mod test {
         )?);
 
         match validate_rule(
+            "test",
             &[
                 SessionProperty::new_required("session_id"),
                 SessionProperty::new_optional("session_id_1", None),
@@ -529,7 +600,7 @@ mod test {
             ]),
         ) {
             Err(error) => {
-                assert_snapshot!(error.message(), @"session property session_id is required, but not found in headers");
+                assert_snapshot!(error.message(), @"session property session_id is required for `test` rule but not found in headers");
             }
             _ => panic!("should be error"),
         }
@@ -584,7 +655,7 @@ mod test {
 
         match build_filter_expression(&state, Arc::clone(&model), &headers, &rule) {
             Err(error) => {
-                assert_snapshot!(error.to_string(), @"Error during planning: The session property not_found is not found in the session properties");
+                assert_snapshot!(error.to_string(), @"Error during planning: The session property not_found is required for `test` rule but not found in the session properties");
             }
             _ => panic!("should be error"),
         }
@@ -604,7 +675,7 @@ mod test {
         )]));
         match build_filter_expression(&state, Arc::clone(&model), &headers, &rule) {
             Err(error) => {
-                assert_snapshot!(error.to_string(), @"Error during planning: The session property session_name is not found in the session properties");
+                assert_snapshot!(error.to_string(), @"Error during planning: The session property session_name is required for `test` rule but not found in the session properties");
             }
             _ => panic!("should be error"),
         }
@@ -763,7 +834,7 @@ mod test {
 
         match validate_rlac_rule(&rule, &model) {
             Err(error) => {
-                assert_snapshot!(error.message(), @"The session property @session_name is used, but not found in the session properties");
+                assert_snapshot!(error.message(), @"The session property @session_name is used for `test` rule, but not found in the session properties");
             }
             _ => panic!("should be error"),
         }

@@ -4,8 +4,6 @@ import os
 import orjson
 import pytest
 
-from app.model.validator import rules
-
 pytestmark = pytest.mark.snowflake
 
 base_url = "/v2/connector/snowflake"
@@ -16,6 +14,14 @@ connection_info = {
     "database": "SNOWFLAKE_SAMPLE_DATA",
     "schema": "TPCH_SF1",
     "warehouse": "COMPUTE_WH",
+    "private_key": os.getenv("SNOWFLAKE_PRIVATE_KEY"),
+}
+
+connection_info_without_warehouse = {
+    "user": os.getenv("SNOWFLAKE_USER"),
+    "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+    "database": "SNOWFLAKE_SAMPLE_DATA",
+    "schema": "TPCH_SF1",
     "private_key": os.getenv("SNOWFLAKE_PRIVATE_KEY"),
 }
 
@@ -109,7 +115,44 @@ async def test_query(client, manifest_str):
         "orderkey": "int64",
         "custkey": "int64",
         "orderstatus": "string",
-        "totalprice": "decimal128(12, 2)",
+        "totalprice": "decimal128(38, 9)",
+        "orderdate": "date32[day]",
+        "order_cust_key": "string",
+        "timestamp": "timestamp[ns]",
+        "timestamptz": "timestamp[ns, tz=UTC]",
+        "test_null_time": "timestamp[ns]",
+    }
+
+
+async def test_query_without_warehouse(client, manifest_str):
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info_without_warehouse,
+            "manifestStr": manifest_str,
+            "sql": 'SELECT * FROM "Orders" ORDER BY "orderkey" LIMIT 1',
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["columns"]) == len(manifest["models"][0]["columns"])
+    assert len(result["data"]) == 1
+    assert result["data"][0] == [
+        1,
+        36901,
+        "O",
+        "173665.47",
+        "1996-01-02",
+        "1_36901",
+        "2024-01-01 23:59:59.000000",
+        "2024-01-01 23:59:59.000000 +00:00",
+        None,
+    ]
+    assert result["dtypes"] == {
+        "orderkey": "int64",
+        "custkey": "int64",
+        "orderstatus": "string",
+        "totalprice": "decimal128(38, 9)",
         "orderdate": "date32[day]",
         "order_cust_key": "string",
         "timestamp": "timestamp[ns]",
@@ -139,14 +182,14 @@ async def test_query_with_password_connection_info(client, manifest_str):
         "1996-01-02",
         "1_36901",
         "2024-01-01 23:59:59.000000",
-        "2024-01-01 23:59:59.000000 UTC",
+        "2024-01-01 23:59:59.000000 +00:00",
         None,
     ]
     assert result["dtypes"] == {
         "orderkey": "int64",
         "custkey": "int64",
         "orderstatus": "string",
-        "totalprice": "decimal128(12, 2)",
+        "totalprice": "decimal128(38, 9)",
         "orderdate": "date32[day]",
         "order_cust_key": "string",
         "timestamp": "timestamp[ns]",
@@ -225,96 +268,6 @@ async def test_query_with_dry_run_and_invalid_sql(client, manifest_str):
     )
     assert response.status_code == 422
     assert response.text is not None
-
-
-async def test_validate_with_unknown_rule(client, manifest_str):
-    response = await client.post(
-        url=f"{base_url}/validate/unknown_rule",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 404
-    assert (
-        response.text == f"The rule `unknown_rule` is not in the rules, rules: {rules}"
-    )
-
-
-async def test_validate_rule_column_is_valid(client, manifest_str):
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 204
-
-
-async def test_validate_rule_column_is_valid_with_invalid_parameters(
-    client, manifest_str
-):
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "X", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "X"},
-        },
-    )
-    assert response.status_code == 422
-
-
-async def test_validate_rule_column_is_valid_without_parameters(client, manifest_str):
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={"connectionInfo": connection_info, "manifestStr": manifest_str},
-    )
-    assert response.status_code == 422
-    result = response.json()
-    assert result["detail"][0] is not None
-    assert result["detail"][0]["type"] == "missing"
-    assert result["detail"][0]["loc"] == ["body", "parameters"]
-    assert result["detail"][0]["msg"] == "Field required"
-
-
-async def test_validate_rule_column_is_valid_without_one_parameter(
-    client, manifest_str
-):
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `columnName`"
-
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `modelName`"
 
 
 async def test_metadata_list_tables(client):

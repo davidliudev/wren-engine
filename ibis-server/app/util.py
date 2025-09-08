@@ -1,13 +1,25 @@
+import asyncio
 import base64
+import time
+
+try:
+    import clickhouse_connect
+
+    ClickHouseDbError = clickhouse_connect.driver.exceptions.DatabaseError
+except ImportError:  # pragma: no cover
+
+    class ClickHouseDbError(Exception):
+        pass
+
 
 import datafusion
 import orjson
 import pandas as pd
+import psycopg
 import pyarrow as pa
+import trino
 import wren_core
 from fastapi import Header
-from ibis.expr.datatypes import Decimal
-from ibis.expr.types import Table
 from loguru import logger
 from opentelemetry import trace
 from opentelemetry.baggage.propagation import W3CBaggagePropagator
@@ -20,6 +32,7 @@ from opentelemetry.trace import (
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from starlette.datastructures import Headers
 
+from app.config import get_config
 from app.dependencies import (
     X_CACHE_CREATE_AT,
     X_CACHE_HIT,
@@ -28,6 +41,8 @@ from app.dependencies import (
     X_WREN_TIMEZONE,
 )
 from app.model.data_source import DataSource
+from app.model.error import DatabaseTimeoutError
+from app.model.metadata.metadata import Metadata
 
 tracer = trace.get_tracer(__name__)
 
@@ -188,20 +203,6 @@ def pd_to_arrow_schema(df: pd.DataFrame) -> pa.Schema:
     return pa.schema(fields)
 
 
-def round_decimal_columns(ibis_table: Table, scale: int = 9) -> Table:
-    fields = []
-    for name, dtype in ibis_table.schema().items():
-        col = ibis_table[name]
-        if isinstance(dtype, Decimal):
-            # maxinum precision for pyarrow decimal is 38
-            decimal_type = Decimal(precision=38, scale=scale)
-            col = col.cast(decimal_type).round(scale)
-            fields.append(col.name(name))
-        else:
-            fields.append(col)
-    return ibis_table.select(*fields)
-
-
 def update_response_headers(response, required_headers: dict):
     if X_CACHE_HIT in required_headers:
         response.headers[X_CACHE_HIT] = required_headers[X_CACHE_HIT]
@@ -239,3 +240,139 @@ def _formater(field: pa.Field) -> str:
     elif pa.types.is_interval(field.type):
         return f"cast({column_name} as varchar) as {column_name}"
     return column_name
+
+
+def _safe_close_connector(connector):
+    """Safely close a connector with additional error handling."""
+    try:
+        time.sleep(0.1)
+        connector.close()
+    except Exception as e:
+        logger.warning(f"Error in _safe_close_connector: {e}")
+
+
+app_timeout_seconds = get_config().app_timeout_seconds
+
+
+async def execute_with_timeout(operation, operation_name: str):
+    """Asynchronously execute an operation with a timeout."""
+    try:
+        return await asyncio.wait_for(operation, timeout=app_timeout_seconds)
+    except TimeoutError:
+        raise DatabaseTimeoutError(
+            f"{operation_name} timeout after {app_timeout_seconds} seconds"
+        )
+    except ClickHouseDbError as e:
+        if "TIMEOUT_EXCEEDED" in str(e):
+            raise DatabaseTimeoutError(f"{operation_name} was cancelled: {e}")
+        raise
+    except trino.exceptions.TrinoQueryError as e:
+        if e.error_name == "EXCEEDED_TIME_LIMIT":
+            raise DatabaseTimeoutError(f"{operation_name} was cancelled: {e}")
+        raise
+    except psycopg.errors.QueryCanceled as e:
+        raise DatabaseTimeoutError(f"{operation_name} was cancelled: {e}")
+
+
+async def _safe_execute_task_with_timeout(
+    operation_name: str,
+    query_task: asyncio.Task,
+    connector,
+):
+    """Execute a database query with a timeout control and handle cancellation."""
+    try:
+        # Create the query task
+        return await execute_with_timeout(query_task, operation_name)
+    except DatabaseTimeoutError:
+        # Cancel the task if it's still running
+        if query_task and not query_task.done():
+            query_task.cancel()
+            try:
+                # Wait a bit for the task to cancel gracefully
+                await asyncio.wait_for(query_task, timeout=2.0)
+            except (TimeoutError, asyncio.CancelledError):
+                # Task didn't cancel in time or was cancelled
+                logger.warning(
+                    f"{operation_name} task cancellation timed out or was cancelled"
+                )
+
+        # Now attempt to close the connection with additional safety
+        cleanup_task = asyncio.create_task(
+            asyncio.to_thread(_safe_close_connector, connector)
+        )
+        try:
+            await asyncio.wait_for(cleanup_task, timeout=5.0)
+        except TimeoutError:
+            logger.warning("Connection cleanup timed out")
+        except Exception as e:
+            logger.warning(f"Error during connection cleanup: {e}")
+        raise
+
+
+async def execute_query_with_timeout(
+    connector,
+    sql: str,
+    limit: int | None = None,
+):
+    """Execute a database query with a timeout control."""
+    query_task = asyncio.create_task(
+        asyncio.to_thread(connector.query, sql, limit=limit)
+    )
+    return await _safe_execute_task_with_timeout(
+        "Query",
+        query_task,
+        connector,
+    )
+
+
+async def execute_validate_with_timeout(
+    validator,
+    rule_name: str,
+    parameters,
+    manifest_str: str,
+):
+    """Execute a validation rule with a timeout control."""
+    return await execute_with_timeout(
+        validator.validate(rule_name, parameters, manifest_str),
+        "Validation",
+    )
+
+
+async def execute_dry_run_with_timeout(connector, sql: str):
+    """Dry run a database query with a timeout control."""
+    dry_run_task = asyncio.create_task(asyncio.to_thread(connector.dry_run, sql))
+    return await _safe_execute_task_with_timeout(
+        "Dry-Run",
+        dry_run_task,
+        connector,
+    )
+
+
+async def execute_get_table_list_with_timeout(
+    metadata: Metadata,
+):
+    """Get the list of tables with a timeout control."""
+    return await execute_with_timeout(
+        asyncio.to_thread(metadata.get_table_list),
+        "Get Table List",
+    )
+
+
+async def execute_get_constraints_with_timeout(
+    metadata: Metadata,
+):
+    """Get the constraints of a table with a timeout control."""
+    return await execute_with_timeout(
+        asyncio.to_thread(metadata.get_constraints),
+        "Get Constraints",
+    )
+
+
+async def execute_get_version_with_timeout(
+    metadata: Metadata,
+):
+    """Get the database version with a timeout control."""
+    return await execute_with_timeout(
+        asyncio.to_thread(metadata.get_version),
+        "Get Database Version",
+    )

@@ -4,12 +4,13 @@ from urllib.parse import quote_plus, urlparse
 import geopandas as gpd
 import orjson
 import pandas as pd
-import psycopg
 import pytest
 import sqlalchemy
 from sqlalchemy import text
 from testcontainers.postgres import PostgresContainer
 
+from app.model.data_source import X_WREN_DB_STATEMENT_TIMEOUT
+from app.model.error import ErrorCode, ErrorPhase
 from app.model.validator import rules
 from tests.conftest import file_path
 
@@ -425,19 +426,20 @@ async def test_dry_run_with_connection_url_and_password_with_bracket_should_not_
         netloc=f"{part.username}:{password_with_bracket}@{part.hostname}:{part.port}"
     ).geturl()
 
-    with pytest.raises(
-        psycopg.OperationalError,
-        match=r'.*FATAL:  password authentication failed for user "test".*',
-    ):
-        await client.post(
-            url=f"{base_url}/query",
-            params={"dryRun": True},
-            json={
-                "connectionInfo": {"connectionUrl": connection_url},
-                "manifestStr": manifest_str,
-                "sql": 'SELECT * FROM "Orders" LIMIT 1',
-            },
-        )
+    response = await client.post(
+        url=f"{base_url}/query",
+        params={"dryRun": True},
+        json={
+            "connectionInfo": {"connectionUrl": connection_url},
+            "manifestStr": manifest_str,
+            "sql": 'SELECT * FROM "Orders" LIMIT 1',
+        },
+    )
+
+    assert response.status_code == 422
+    result = response.json()
+    assert result["errorCode"] == ErrorCode.GET_CONNECTION_ERROR.name
+    assert 'password authentication failed for user "test"' in result["message"]
 
 
 async def test_query_with_limit(client, manifest_str, postgres: PostgresContainer):
@@ -593,7 +595,8 @@ async def test_validate_with_unknown_rule(
     )
     assert response.status_code == 404
     assert (
-        response.text == f"The rule `unknown_rule` is not in the rules, rules: {rules}"
+        response.json()["message"]
+        == f"The rule `unknown_rule` is not in the rules, rules: {rules}"
     )
 
 
@@ -666,7 +669,10 @@ async def test_validate_rule_column_is_valid_without_one_parameter(
         },
     )
     assert response.status_code == 422
-    assert response.text == "Missing required parameter: `columnName`"
+    result = response.json()
+    assert result["errorCode"] == ErrorCode.VALIDATION_PARAMETER_ERROR.name
+    assert result["message"] == "columnName is required"
+    assert result["phase"] == ErrorPhase.VALIDATION.name
 
     response = await client.post(
         url=f"{base_url}/validate/column_is_valid",
@@ -677,7 +683,7 @@ async def test_validate_rule_column_is_valid_without_one_parameter(
         },
     )
     assert response.status_code == 422
-    assert response.text == "Missing required parameter: `modelName`"
+    assert response.json()["message"] == "modelName is required"
 
 
 async def test_metadata_list_tables(client, postgres: PostgresContainer):
@@ -785,7 +791,7 @@ async def test_model_substitute(
             "sql": 'SELECT * FROM "orders"',
         },
     )
-    assert response.status_code == 422
+    assert response.status_code == 404
 
     # Test only have x-user-catalog but have schema in SQL
     response = await client.post(
@@ -813,7 +819,7 @@ async def test_model_substitute(
             "sql": 'SELECT * FROM "orders"',
         },
     )
-    assert response.status_code == 422
+    assert response.status_code == 404
 
     # Test only have x-user-schema
     response = await client.post(
@@ -944,8 +950,8 @@ async def test_model_substitute_out_of_scope(
             "sql": 'SELECT * FROM "Nation" LIMIT 1',
         },
     )
-    assert response.status_code == 422
-    assert response.text == 'Model not found: "Nation"'
+    assert response.status_code == 404
+    assert response.json()["message"] == 'Model not found: "Nation"'
 
     # Test without catalog and schema in SQL but in headers(x-user-xxx)
     response = await client.post(
@@ -957,8 +963,8 @@ async def test_model_substitute_out_of_scope(
             "sql": 'SELECT * FROM "Nation" LIMIT 1',
         },
     )
-    assert response.status_code == 422
-    assert response.text == 'Model not found: "Nation"'
+    assert response.status_code == 404
+    assert response.json()["message"] == 'Model not found: "Nation"'
 
 
 async def test_model_substitute_non_existent_column(
@@ -975,7 +981,8 @@ async def test_model_substitute_non_existent_column(
         },
     )
     assert response.status_code == 422
-    assert 'column "x" does not exist' in response.text
+    result = response.json()
+    assert 'column "x" does not exist' in result["message"]
 
     # Test without catalog and schema in SQL but in headers(x-user-xxx)
     response = await client.post(
@@ -988,7 +995,8 @@ async def test_model_substitute_non_existent_column(
         },
     )
     assert response.status_code == 422
-    assert 'column "x" does not exist' in response.text
+    result = response.json()
+    assert 'column "x" does not exist' in result["message"]
 
 
 async def test_postgis_geometry(client, manifest_str, postgis: PostgresContainer):
@@ -1024,6 +1032,61 @@ async def test_decimal_precision(client, manifest_str, postgres: PostgresContain
     result = response.json()
     assert len(result["data"]) == 1
     assert result["data"][0][0] == "0.333333333"
+
+
+async def test_connection_timeout(client, manifest_str, postgres: PostgresContainer):
+    connection_info = _to_connection_info(postgres)
+    # Set a very short timeout to force a timeout error
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT 1 FROM (SELECT pg_sleep(5))",  # This will take longer than the default timeout
+        },
+        headers={X_WREN_DB_STATEMENT_TIMEOUT: "1"},  # Set timeout to 1 second
+    )
+    assert response.status_code == 504  # Gateway Timeout
+    result = response.json()
+    assert result["errorCode"] == ErrorCode.DATABASE_TIMEOUT.name
+    assert (
+        "Query was cancelled: canceling statement due to statement timeout"
+        in result["message"]
+    )
+
+
+async def test_uuid_type(client, manifest_str, postgres: PostgresContainer):
+    connection_info = _to_connection_info(postgres)
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "select '123e4567-e89b-12d3-a456-426614174000'::uuid as order_uuid",
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["data"]) == 1
+    assert result["data"][0][0] == "123e4567-e89b-12d3-a456-426614174000"
+
+
+async def test_order_by_nulls_last(client, manifest_str, postgres: PostgresContainer):
+    connection_info = _to_connection_info(postgres)
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT letter FROM (VALUES (1, 'one'), (2, 'two'), (null, 'three')) AS t (num, letter) ORDER BY num",
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["data"]) == 3
+    assert result["data"][0][0] == "one"
+    assert result["data"][1][0] == "two"
+    assert result["data"][2][0] == "three"
 
 
 def _to_connection_info(pg: PostgresContainer):

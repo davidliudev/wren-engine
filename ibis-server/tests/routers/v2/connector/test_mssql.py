@@ -8,7 +8,6 @@ import sqlalchemy
 from sqlalchemy import text
 from testcontainers.mssql import SqlServerContainer
 
-from app.model.validator import rules
 from tests.conftest import file_path
 
 pytestmark = pytest.mark.mssql
@@ -64,6 +63,17 @@ manifest = {
             ],
             "primaryKey": "orderkey",
         },
+        {
+            "name": "null_test",
+            "tableReference": {
+                "schema": "dbo",
+                "table": "null_test",
+            },
+            "columns": [
+                {"name": "id", "type": "integer"},
+                {"name": "letter", "type": "varchar"},
+            ],
+        },
     ],
 }
 
@@ -103,6 +113,20 @@ def mssql(request) -> SqlServerContainer:
                     @level2type = N'COLUMN', @level2name = 'o_comment';
             """)
         )
+        conn.execute(text('CREATE TABLE "null_test" ("id" INT, "letter" TEXT)'))
+        conn.execute(
+            text(
+                "INSERT INTO \"null_test\" (\"id\", \"letter\") VALUES (1, 'one'), (2, 'two'), (NULL, 'three')"
+            )
+        )
+
+        conn.execute(text("CREATE TABLE uuid_test (order_uuid uniqueidentifier)"))
+        conn.execute(
+            text(
+                "INSERT INTO uuid_test (order_uuid) VALUES (cast('123e4567-e89b-12d3-a456-426614174000' as uniqueidentifier))"
+            )
+        )
+
     request.addfinalizer(mssql.stop)
     return mssql
 
@@ -264,107 +288,6 @@ async def test_query_non_ascii_column(client, manifest_str, mssql: SqlServerCont
     assert result["columns"] == ["калона"]
 
 
-async def test_validate_with_unknown_rule(
-    client, manifest_str, mssql: SqlServerContainer
-):
-    connection_info = _to_connection_info(mssql)
-    response = await client.post(
-        url=f"{base_url}/validate/unknown_rule",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 404
-    assert (
-        response.text == f"The rule `unknown_rule` is not in the rules, rules: {rules}"
-    )
-
-
-async def test_validate_rule_column_is_valid(
-    client, manifest_str, mssql: SqlServerContainer
-):
-    connection_info = _to_connection_info(mssql)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 204
-
-
-async def test_validate_rule_column_is_valid_with_invalid_parameters(
-    client, manifest_str, mssql: SqlServerContainer
-):
-    connection_info = _to_connection_info(mssql)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "X", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "X"},
-        },
-    )
-    assert response.status_code == 422
-
-
-async def test_validate_rule_column_is_valid_without_parameters(
-    client, manifest_str, mssql: SqlServerContainer
-):
-    connection_info = _to_connection_info(mssql)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={"connectionInfo": connection_info, "manifestStr": manifest_str},
-    )
-    assert response.status_code == 422
-    result = response.json()
-    assert result["detail"][0] is not None
-    assert result["detail"][0]["type"] == "missing"
-    assert result["detail"][0]["loc"] == ["body", "parameters"]
-    assert result["detail"][0]["msg"] == "Field required"
-
-
-async def test_validate_rule_column_is_valid_without_one_parameter(
-    client, manifest_str, mssql: SqlServerContainer
-):
-    connection_info = _to_connection_info(mssql)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `columnName`"
-
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `modelName`"
-
-
 async def test_metadata_list_tables(client, mssql: SqlServerContainer):
     connection_info = _to_connection_info(mssql)
     response = await client.post(
@@ -436,6 +359,112 @@ async def test_password_with_special_characters(client):
 
         assert response.status_code == 200
         assert "Microsoft SQL Server 2019" in response.text
+
+
+async def test_order_by_nulls_last(client, manifest_str, mssql: SqlServerContainer):
+    connection_info = _to_connection_info(mssql)
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": 'SELECT letter FROM "null_test" ORDER BY id',
+        },
+        params={"limit": 3},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["data"]) == 3
+    assert result["data"][0][0] == "one"
+    assert result["data"][1][0] == "two"
+    assert result["data"][2][0] == "three"
+
+    connection_info = _to_connection_info(mssql)
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": 'SELECT letter FROM "null_test" ORDER BY id LIMIT 3',
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["data"]) == 3
+    assert result["data"][0][0] == "one"
+    assert result["data"][1][0] == "two"
+    assert result["data"][2][0] == "three"
+
+
+async def test_order_by_without_limit(client, manifest_str, mssql: SqlServerContainer):
+    connection_info = _to_connection_info(mssql)
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": 'SELECT letter FROM "null_test" ORDER BY id',
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["data"]) == 3
+    assert result["data"][0][0] == "one"
+    assert result["data"][1][0] == "two"
+    assert result["data"][2][0] == "three"
+
+
+# we dont give the expression a alias on purpose
+async def test_decimal_precision(client, manifest_str, mssql: SqlServerContainer):
+    connection_info = _to_connection_info(mssql)
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT cast(1 as decimal(38, 8)) / cast(3 as decimal(38, 8))",
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["data"]) == 1
+    assert result["data"][0][0] == "0.333333"
+
+
+async def test_uuid_type(client, mssql: SqlServerContainer):
+    connection_info = _to_connection_info(mssql)
+    manifest = {
+        "catalog": "my_catalog",
+        "schema": "my_schema",
+        "models": [
+            {
+                "name": "uuid_test",
+                "tableReference": {
+                    "schema": "dbo",
+                    "table": "uuid_test",
+                },
+                "columns": [
+                    {"name": "order_uuid", "type": "uuid"},
+                ],
+            },
+        ],
+    }
+    manifest_str = base64.b64encode(orjson.dumps(manifest)).decode("utf-8")
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "select order_uuid from uuid_test",
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["data"]) == 1
+    assert result["data"][0][0] == "123E4567-E89B-12D3-A456-426614174000"
+    assert result["dtypes"] == {
+        "order_uuid": "string",
+    }
 
 
 def _to_connection_info(mssql: SqlServerContainer):

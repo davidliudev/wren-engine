@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::vec;
 use tokio::runtime::Runtime;
 use wren_core::array::AsArray;
-use wren_core::ast::{visit_statements_mut, Expr, Statement, Value};
+use wren_core::ast::{visit_statements_mut, Expr, Statement, Value, ValueWithSpan};
 use wren_core::dialect::GenericDialect;
 use wren_core::mdl::context::create_ctx_with_mdl;
 use wren_core::mdl::function::{
@@ -46,6 +46,7 @@ use wren_core::{
 #[derive(Clone)]
 pub struct PySessionContext {
     ctx: wren_core::SessionContext,
+    exec_ctx: wren_core::SessionContext,
     mdl: Arc<AnalyzedWrenMDL>,
     properties: Arc<HashMap<String, Option<String>>>,
     runtime: Arc<Runtime>,
@@ -61,6 +62,7 @@ impl Default for PySessionContext {
     fn default() -> Self {
         Self {
             ctx: wren_core::SessionContext::new(),
+            exec_ctx: wren_core::SessionContext::new(),
             mdl: Arc::new(AnalyzedWrenMDL::default()),
             properties: Arc::new(HashMap::new()),
             runtime: Arc::new(Runtime::new().unwrap()),
@@ -115,7 +117,8 @@ impl PySessionContext {
 
         let Some(mdl_base64) = mdl_base64 else {
             return Ok(Self {
-                ctx,
+                ctx: ctx.clone(),
+                exec_ctx: ctx,
                 mdl: Arc::new(AnalyzedWrenMDL::default()),
                 properties: Arc::new(HashMap::new()),
                 runtime: Arc::new(runtime),
@@ -158,32 +161,44 @@ impl PySessionContext {
             };
             let manifest = to_manifest(mdl_base64)?;
             let properties_ref = Arc::new(properties_map);
-            let Ok(analyzed_mdl) = AnalyzedWrenMDL::analyze(
+            match AnalyzedWrenMDL::analyze(
                 manifest,
                 Arc::clone(&properties_ref),
                 mdl::context::Mode::Unparse,
-            ) else {
-                return Err(CoreError::new("Failed to analyze manifest").into());
-            };
+            ) {
+                Ok(analyzed_mdl) => {
+                    let analyzed_mdl = Arc::new(analyzed_mdl);
+                    let unparser_ctx = runtime
+                        .block_on(create_ctx_with_mdl(
+                            &ctx,
+                            Arc::clone(&analyzed_mdl),
+                            Arc::clone(&properties_ref),
+                            mdl::context::Mode::Unparse,
+                        ))
+                        .map_err(CoreError::from)?;
 
-            let analyzed_mdl = Arc::new(analyzed_mdl);
+                    let exec_ctx = runtime
+                        .block_on(create_ctx_with_mdl(
+                            &ctx,
+                            Arc::clone(&analyzed_mdl),
+                            Arc::clone(&properties_ref),
+                            mdl::context::Mode::LocalRuntime,
+                        ))
+                        .map_err(CoreError::from)?;
 
-            // the headers won't be used in the context. Provide an empty map.
-            let ctx = runtime
-                .block_on(create_ctx_with_mdl(
-                    &ctx,
-                    Arc::clone(&analyzed_mdl),
-                    Arc::new(HashMap::new()),
-                    mdl::context::Mode::Unparse,
-                ))
-                .map_err(CoreError::from)?;
-
-            Ok(Self {
-                ctx,
-                mdl: analyzed_mdl,
-                runtime: Arc::new(runtime),
-                properties: properties_ref,
-            })
+                    Ok(Self {
+                        ctx: unparser_ctx,
+                        exec_ctx,
+                        mdl: analyzed_mdl,
+                        runtime: Arc::new(runtime),
+                        properties: properties_ref,
+                    })
+                }
+                Err(e) => Err(CoreError::new(
+                    format!("Failed to analyze MDL: {}", e).as_str(),
+                )
+                .into()),
+            }
         })
     }
 
@@ -211,7 +226,7 @@ impl PySessionContext {
     pub fn get_available_functions(&self) -> PyResult<Vec<PyRemoteFunction>> {
         let registered_functions: Vec<PyRemoteFunction> = self
             .runtime
-            .block_on(Self::get_regietered_functions(&self.ctx))
+            .block_on(Self::get_regietered_functions(&self.exec_ctx))
             .map_err(CoreError::from)?
             .into_iter()
             .map(|f| f.into())
@@ -238,17 +253,23 @@ impl PySessionContext {
         let _ = visit_statements_mut(&mut statements, |stmt| {
             if let Statement::Query(q) = stmt {
                 if let Some(limit) = &q.limit {
-                    if let Expr::Value(Value::Number(n, is)) = limit {
-                        if n.parse::<usize>().unwrap() > pushdown {
-                            q.limit = Some(Expr::Value(Value::Number(
-                                pushdown.to_string(),
-                                *is,
-                            )));
+                    if let Expr::Value(ValueWithSpan {
+                        value: Value::Number(n, is),
+                        ..
+                    }) = limit
+                    {
+                        if let Ok(curr) = n.parse::<usize>() {
+                            if curr > pushdown {
+                                q.limit = Some(Expr::Value(
+                                    Value::Number(pushdown.to_string(), *is).into(),
+                                ));
+                            }
                         }
                     }
                 } else {
-                    q.limit =
-                        Some(Expr::Value(Value::Number(pushdown.to_string(), false)));
+                    q.limit = Some(Expr::Value(
+                        Value::Number(pushdown.to_string(), false).into(),
+                    ));
                 }
             }
             ControlFlow::<()>::Continue(())

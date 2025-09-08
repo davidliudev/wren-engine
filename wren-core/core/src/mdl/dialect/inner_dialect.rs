@@ -19,11 +19,14 @@
 
 use crate::mdl::dialect::utils::scalar_function_to_sql_internal;
 use crate::mdl::manifest::DataSource;
-use datafusion::common::Result;
+use datafusion::common::{plan_err, Result};
 use datafusion::logical_expr::sqlparser::keywords::ALL_KEYWORDS;
 use datafusion::logical_expr::Expr;
 
-use datafusion::sql::sqlparser::ast;
+use datafusion::scalar::ScalarValue;
+use datafusion::sql::sqlparser::ast::{
+    self, ExtractSyntax, Function, Ident, ObjectName, ObjectNamePart, WindowFrameBound,
+};
 use datafusion::sql::unparser::Unparser;
 use regex::Regex;
 
@@ -47,6 +50,19 @@ pub trait InnerDialect: Send + Sync {
 
     fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
         None
+    }
+
+    fn col_alias_overrides(&self, _alias: &str) -> Result<Option<String>> {
+        Ok(None)
+    }
+
+    fn window_func_support_window_frame(
+        &self,
+        _func_name: &str,
+        _start_bound: &WindowFrameBound,
+        _end_bound: &WindowFrameBound,
+    ) -> bool {
+        true
     }
 }
 
@@ -77,7 +93,7 @@ impl InnerDialect for MySQLDialect {
         args: &[Expr],
     ) -> Result<Option<ast::Expr>> {
         match function_name {
-            "btrim" => scalar_function_to_sql_internal(unparser, "trim", args),
+            "btrim" => scalar_function_to_sql_internal(unparser, None, "trim", args),
             _ => Ok(None),
         }
     }
@@ -88,6 +104,184 @@ pub struct BigQueryDialect {}
 impl InnerDialect for BigQueryDialect {
     fn unnest_as_table_factor(&self) -> bool {
         true
+    }
+
+    fn col_alias_overrides(&self, alias: &str) -> Result<Option<String>> {
+        // Check if alias contains any special characters not supported by BigQuery col names
+        // https://cloud.google.com/bigquery/docs/schemas#flexible-column-names
+        let special_chars: [char; 20] = [
+            '!', '"', '$', '(', ')', '*', ',', '.', '/', ';', '?', '@', '[', '\\', ']',
+            '^', '`', '{', '}', '~',
+        ];
+
+        if alias.chars().any(|c| special_chars.contains(&c)) {
+            let mut encoded_name = String::new();
+            for c in alias.chars() {
+                if special_chars.contains(&c) {
+                    encoded_name.push_str(&format!("_{}", c as u32));
+                } else {
+                    encoded_name.push(c);
+                }
+            }
+            Ok(Some(encoded_name))
+        } else {
+            Ok(Some(alias.to_string()))
+        }
+    }
+
+    fn scalar_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        function_name: &str,
+        args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        match function_name {
+            "date_part" => {
+                if args.len() != 2 {
+                    return plan_err!(
+                        "date_part requires exactly 2 arguments, found {}",
+                        args.len()
+                    );
+                }
+                Ok(Some(ast::Expr::Extract {
+                    field: self.datetime_field_from_expr(&args[0])?,
+                    syntax: ExtractSyntax::From,
+                    expr: Box::new(unparser.expr_to_sql(&args[1])?),
+                }))
+            }
+            "date_diff" => {
+                if args.len() != 3 {
+                    return plan_err!(
+                        "date_diff requires exactly 3 arguments, found {}",
+                        args.len()
+                    );
+                }
+                let Expr::Literal(ScalarValue::Utf8(Some(s)), _) = args[0].clone() else {
+                    return plan_err!(
+                        "date_diff requires a string literal as the third argument"
+                    );
+                };
+                let granularity = ast::Expr::Identifier(Ident::new(
+                    self.datetime_field_from_str(&s)?.to_string(),
+                ));
+                // DATE_DIFF(end_date, start_date, granularity)
+                // https://cloud.google.com/bigquery/docs/reference/standard-sql/date_functions#date_diff
+                Ok(Some(ast::Expr::Function(Function {
+                    name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(
+                        "DATE_DIFF",
+                    ))]),
+                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                        duplicate_treatment: None,
+                        args: vec![
+                            unparser.expr_to_sql(&args[2]).map(|e| {
+                                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                            })?,
+                            unparser.expr_to_sql(&args[1]).map(|e| {
+                                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                            })?,
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                                granularity,
+                            )),
+                        ],
+                        clauses: vec![],
+                    }),
+                    filter: None,
+                    null_treatment: None,
+                    over: None,
+                    within_group: vec![],
+                    parameters: ast::FunctionArguments::None,
+                    uses_odbc_syntax: false,
+                })))
+            }
+            "now" => {
+                scalar_function_to_sql_internal(unparser, None, "CURRENT_TIMESTAMP", args)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// BigQuery only allow the aggregation function with window frame.
+    /// Other [window functions](https://cloud.google.com/bigquery/docs/reference/standard-sql/window-functions) are not supported.
+    fn window_func_support_window_frame(
+        &self,
+        func_name: &str,
+        _start_bound: &WindowFrameBound,
+        _end_bound: &WindowFrameBound,
+    ) -> bool {
+        !matches!(
+            func_name,
+            "cume_dist"
+                | "dense_rank"
+                | "first_value"
+                | "lag"
+                | "last_value"
+                | "lead"
+                | "nth_value"
+                | "ntile"
+                | "percent_rank"
+                | "percentile_cont"
+                | "percentile_disc"
+                | "rank"
+                | "row_number"
+                | "st_clusterdbscan"
+        )
+    }
+}
+
+impl BigQueryDialect {
+    fn datetime_field_from_expr(&self, expr: &Expr) -> Result<ast::DateTimeField> {
+        match expr {
+            Expr::Literal(ScalarValue::Utf8(Some(s)), _)
+            | Expr::Literal(ScalarValue::LargeUtf8(Some(s)), _) => {
+                Ok(self.datetime_field_from_str(s)?)
+            }
+            _ => plan_err!(
+                "Invalid argument type for datetime field. Expected UTF8 string."
+            ),
+        }
+    }
+
+    /// BigQuery supports only the following date part
+    /// <https://cloud.google.com/bigquery/docs/reference/standard-sql/date_functions#extract>
+    fn datetime_field_from_str(&self, s: &str) -> Result<ast::DateTimeField> {
+        let s = s.to_uppercase();
+        if s.starts_with("WEEK") {
+            if s.len() > 4 {
+                // Parse WEEK(MONDAY) format
+                if let Some(start) = s.find('(') {
+                    if let Some(end) = s.find(')') {
+                        let weekday = &s[start + 1..end];
+                        match weekday {
+                            "SUNDAY" | "MONDAY" | "TUESDAY" | "WEDNESDAY" 
+                            | "THURSDAY" | "FRIDAY" | "SATURDAY" => {
+                                return Ok(ast::DateTimeField::Week(Some(Ident::new(weekday))));
+                            }
+                            _ => return plan_err!("Invalid weekday '{}' for WEEK. Valid values are SUNDAY, MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, and SATURDAY", weekday),
+                        }
+                    }
+                }
+                return plan_err!("Invalid WEEK format '{}'. Expected WEEK(WEEKDAY)", s);
+            }
+            return Ok(ast::DateTimeField::Week(None));
+        }
+        match s.as_str() {
+            "DAYOFWEEK" => Ok(ast::DateTimeField::DayOfWeek),
+            "DAY" => Ok(ast::DateTimeField::Day),
+            "DAYOFYEAR" => Ok(ast::DateTimeField::DayOfYear),
+            "ISOWEEK" => Ok(ast::DateTimeField::IsoWeek),
+            "MONTH" => Ok(ast::DateTimeField::Month),
+            "QUARTER" => Ok(ast::DateTimeField::Quarter),
+            "YEAR" => Ok(ast::DateTimeField::Year),
+            "ISOYEAR" => Ok(ast::DateTimeField::Isoyear),
+            "MICROSECOND" => Ok(ast::DateTimeField::Microsecond),
+            "MILLISECOND" => Ok(ast::DateTimeField::Millisecond),
+            "SECOND" => Ok(ast::DateTimeField::Second),
+            "MINUTE" => Ok(ast::DateTimeField::Minute),
+            "HOUR" => Ok(ast::DateTimeField::Hour),
+            _ => {
+                plan_err!("Unsupported date part '{}' for BIGQUERY. Valid values are: WEEK, DAYOFWEEK, DAY, DAYOFYEAR, ISOWEEK, MONTH, QUARTER, YEAR, ISOYEAR, MICROSECOND, MILLISECOND, SECOND, MINUTE, HOUR", s)
+            }
+        }
     }
 }
 

@@ -6,7 +6,7 @@ import pytest
 from testcontainers.trino import TrinoContainer
 from trino.dbapi import connect
 
-from app.model.validator import rules
+from app.model.data_source import X_WREN_DB_STATEMENT_TIMEOUT
 
 pytestmark = pytest.mark.trino
 
@@ -83,6 +83,19 @@ def trino(request) -> TrinoContainer:
     cur.execute(
         "COMMENT ON COLUMN memory.default.orders.comment IS 'This is a comment'"
     )
+
+    cur.execute("""
+CREATE FUNCTION memory.default.sleep(x integer)
+    RETURNS integer
+    LANGUAGE PYTHON
+    WITH (handler = 'sleep')
+    AS $$
+    def sleep(a):
+        import time
+        time.sleep(a)
+        return 0
+    $$
+                """)
 
     request.addfinalizer(db.stop)
     return db
@@ -258,105 +271,6 @@ async def test_query_with_dry_run_and_invalid_sql(
     assert response.text is not None
 
 
-async def test_validate_with_unknown_rule(client, manifest_str, trino: TrinoContainer):
-    connection_info = _to_connection_info(trino)
-    response = await client.post(
-        url=f"{base_url}/validate/unknown_rule",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 404
-    assert (
-        response.text == f"The rule `unknown_rule` is not in the rules, rules: {rules}"
-    )
-
-
-async def test_validate_rule_column_is_valid(
-    client, manifest_str, trino: TrinoContainer
-):
-    connection_info = _to_connection_info(trino)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 204
-
-
-async def test_validate_rule_column_is_valid_with_invalid_parameters(
-    client, manifest_str, trino: TrinoContainer
-):
-    connection_info = _to_connection_info(trino)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "X", "columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders", "columnName": "X"},
-        },
-    )
-    assert response.status_code == 422
-
-
-async def test_validate_rule_column_is_valid_without_parameters(
-    client, manifest_str, trino: TrinoContainer
-):
-    connection_info = _to_connection_info(trino)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={"connectionInfo": connection_info, "manifestStr": manifest_str},
-    )
-    assert response.status_code == 422
-    result = response.json()
-    assert result["detail"][0] is not None
-    assert result["detail"][0]["type"] == "missing"
-    assert result["detail"][0]["loc"] == ["body", "parameters"]
-    assert result["detail"][0]["msg"] == "Field required"
-
-
-async def test_validate_rule_column_is_valid_without_one_parameter(
-    client, manifest_str, trino: TrinoContainer
-):
-    connection_info = _to_connection_info(trino)
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"modelName": "Orders"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `columnName`"
-
-    response = await client.post(
-        url=f"{base_url}/validate/column_is_valid",
-        json={
-            "connectionInfo": connection_info,
-            "manifestStr": manifest_str,
-            "parameters": {"columnName": "orderkey"},
-        },
-    )
-    assert response.status_code == 422
-    assert response.text == "Missing required parameter: `modelName`"
-
-
 async def test_metadata_list_tables(client, trino: TrinoContainer):
     connection_info = _to_connection_info(trino)
     response = await client.post(
@@ -425,6 +339,35 @@ async def test_metadata_db_version(client, trino: TrinoContainer):
     )
     assert response.status_code == 200
     assert response.text is not None
+
+
+async def test_connection_timeout(client, manifest_str, trino: TrinoContainer):
+    connection_info = _to_connection_info(trino)
+    # Set a very short timeout to force a timeout error
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT memory.default.sleep(3)",  # This will take longer than the default timeout
+        },
+        headers={X_WREN_DB_STATEMENT_TIMEOUT: "1"},  # Set timeout to 1 second
+    )
+    assert response.status_code == 504  # Gateway Timeout
+    assert "Query was cancelled:" in response.text
+
+    connection_info = _to_connection_url(trino)
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": {"connectionUrl": connection_info},
+            "manifestStr": manifest_str,
+            "sql": "SELECT memory.default.sleep(3)",  # This will take longer than the default timeout
+        },
+        headers={X_WREN_DB_STATEMENT_TIMEOUT: "1"},  # Set timeout to 1 second
+    )
+    assert response.status_code == 504  # Gateway Timeout
+    assert "Query was cancelled:" in response.text
 
 
 def _to_connection_info(trino: TrinoContainer):

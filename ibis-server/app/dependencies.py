@@ -1,3 +1,4 @@
+import wren_core
 from fastapi import Request
 from starlette.datastructures import Headers
 
@@ -7,15 +8,19 @@ from app.model.data_source import DataSource
 X_WREN_FALLBACK_DISABLE = "x-wren-fallback_disable"
 X_WREN_VARIABLE_PREFIX = "x-wren-variable-"
 X_WREN_TIMEZONE = "x-wren-timezone"
+X_WREN_DB_STATEMENT_TIMEOUT = "x-wren-db-statement_timeout"
 X_CACHE_HIT = "X-Cache-Hit"
 X_CACHE_CREATE_AT = "X-Cache-Create-At"
 X_CACHE_OVERRIDE = "X-Cache-Override"
 X_CACHE_OVERRIDE_AT = "X-Cache-Override-At"
+X_CORRELATION_ID = "X-Correlation-ID"
 
 
-# Rebuild model to validate the dto is correct via validation of the pydantic
+# Validate the dto by building the specific connection info from the data source
 def verify_query_dto(data_source: DataSource, dto: QueryDTO):
-    data_source.get_dto_type()(**dto.model_dump(by_alias=True))
+    # Use data_source.get_connection_info to validate the connection_info
+    # This will ensure the connection_info can be properly parsed for the specific data source
+    data_source.get_connection_info(dto.connection_info, {})
 
 
 def get_wren_headers(request: Request) -> Headers:
@@ -45,9 +50,8 @@ def _filter_headers(header_string: str) -> bool:
     return False
 
 
-def exist_wren_variables_header(
-    headers: Headers,
-) -> bool:
-    if headers is None:
+def is_backward_compatible(manifest_str: str) -> bool:
+    try:
+        return wren_core.is_backward_compatible(manifest_str)
+    except Exception:
         return False
-    return any(key.startswith(X_WREN_VARIABLE_PREFIX) for key in headers.keys())

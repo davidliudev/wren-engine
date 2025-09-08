@@ -1,4 +1,4 @@
-FROM python:3.11-buster AS builder
+FROM python:3.11-bookworm AS builder
 
 ARG ENV
 ENV ENV=$ENV
@@ -37,13 +37,13 @@ COPY . .
 RUN just install --without dev
 
 
-FROM python:3.11-slim-buster AS runtime
+FROM python:3.11-slim-bookworm AS runtime
 
 # Add microsoft package list
 RUN apt-get update \
     && apt-get install -y curl gnupg \
-    && curl https://packages.microsoft.com/keys/microsoft.asc | tee /etc/apt/trusted.gpg.d/microsoft.asc \
-    && curl https://packages.microsoft.com/config/debian/11/prod.list | tee /etc/apt/sources.list.d/mssql-release.list \
+    && curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
+    && echo "deb [arch=amd64,arm64,armhf signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" | tee /etc/apt/sources.list.d/mssql-release.list \
     && apt-get update
 
 # Install msodbcsql 18 driver for mssql
@@ -58,19 +58,41 @@ RUN apt-get -y install libpq-dev \
 
 ENV VIRTUAL_ENV=/app/.venv \
     PATH="/app/.venv/bin:$PATH" \
-    REMOTE_FUNCTION_LIST_PATH=/resources/function_list
+    PYTHONPATH="/app" \
+    REMOTE_FUNCTION_LIST_PATH=/resources/function_list \
+    REMOTE_WHITE_FUNCTION_LIST_PATH=/resources/white_function_list
+
+# Set working directory before copying files
+WORKDIR /app
 
 COPY --from=builder ${VIRTUAL_ENV} ${VIRTUAL_ENV}
-COPY app app
-COPY resources resources
+COPY app ./app/
+COPY resources ./resources/
+COPY notebooks ./notebooks/
+COPY wren/ ./wren/
+
+# Copy pyproject.toml and poetry.lock for poetry to work
+COPY pyproject.toml poetry.lock ./
+
+# Install poetry in runtime stage
+RUN pip install poetry==1.8.3
+
+# Install jupyter dependencies
+RUN poetry install --without dev --with jupyter
+
+# runtime
+COPY --from=builder /app/.venv ${VIRTUAL_ENV}
 
 # Install Opentelemetry zero-instrumentation python
 RUN pip install opentelemetry-distro opentelemetry-exporter-otlp \
     && opentelemetry-bootstrap -a install
 
+# Generate jupyter lab config
+RUN jupyter lab --generate-config --allow-root
+
 COPY entrypoint.sh ./
 RUN chmod +x ./entrypoint.sh
 
-EXPOSE 8000
+EXPOSE 8000 8888
 
-CMD ["./entrypoint.sh"]
+ENTRYPOINT ["./entrypoint.sh"]

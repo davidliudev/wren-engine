@@ -5,12 +5,12 @@
     <parent>
         <groupId>io.airlift</groupId>
         <artifactId>airbase</artifactId>
-        <version>269</version>
+        <version>279</version>
     </parent>
 
     <groupId>io.wren</groupId>
     <artifactId>wren-root</artifactId>
-    <version>0.17.3-SNAPSHOT</version>
+    <version>0.20.1-SNAPSHOT</version>
     <packaging>pom</packaging>
 
     <name>WrenEngine</name>
@@ -64,11 +64,11 @@
         <air.modernizer.java-version>8</air.modernizer.java-version>
 
         <dep.antlr.version>4.13.2</dep.antlr.version>
-        <dep.airlift.version>269</dep.airlift.version>
+        <dep.airlift.version>305</dep.airlift.version>
         <dep.packaging.version>${dep.airlift.version}</dep.packaging.version>
         <dep.drift.version>1.23</dep.drift.version>
-        <dep.testcontainers.version>1.21.2</dep.testcontainers.version>
-        <dep.errorprone.version>2.38.0</dep.errorprone.version>
+        <dep.testcontainers.version>1.21.3</dep.testcontainers.version>
+        <dep.errorprone.version>2.40.0</dep.errorprone.version>
         <dep.plugin.failsafe.version>${dep.plugin.surefire.version}</dep.plugin.failsafe.version>
         <netty.version>4.1.45.Final</netty.version>
 
@@ -154,6 +154,12 @@
             </dependency>
 
             <dependency>
+                <groupId>com.google.inject</groupId>
+                <artifactId>guice</artifactId>
+                <version>7.0.0</version>
+            </dependency>
+
+            <dependency>
                 <groupId>com.google.protobuf</groupId>
                 <artifactId>protobuf-java</artifactId>
                 <version>4.31.1</version>
@@ -198,12 +204,6 @@
             <dependency>
                 <groupId>io.airlift</groupId>
                 <artifactId>configuration</artifactId>
-                <version>${dep.airlift.version}</version>
-            </dependency>
-
-            <dependency>
-                <groupId>io.airlift</groupId>
-                <artifactId>event</artifactId>
                 <version>${dep.airlift.version}</version>
             </dependency>
 
@@ -274,9 +274,15 @@
             </dependency>
 
             <dependency>
-                <groupId>io.opentelemetry.semconv</groupId>
-                <artifactId>opentelemetry-semconv</artifactId>
-                <version>1.34.0</version>
+                <groupId>io.opentelemetry</groupId>
+                <artifactId>opentelemetry-api</artifactId>
+                <version>1.47.0</version>
+            </dependency>
+
+            <dependency>
+                <groupId>io.opentelemetry</groupId>
+                <artifactId>opentelemetry-sdk</artifactId>
+                <version>1.47.0</version>
             </dependency>
 
             <dependency>
@@ -349,13 +355,13 @@
             <dependency>
                 <groupId>org.checkerframework</groupId>
                 <artifactId>checker-qual</artifactId>
-                <version>3.49.4</version>
+                <version>3.49.5</version>
             </dependency>
 
             <dependency>
                 <groupId>org.duckdb</groupId>
                 <artifactId>duckdb_jdbc</artifactId>
-                <version>1.3.1.0</version>
+                <version>1.3.2.0</version>
             </dependency>
 
             <dependency>

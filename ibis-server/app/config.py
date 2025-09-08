@@ -20,14 +20,12 @@ class Config:
         load_dotenv(override=True)
         self.wren_engine_endpoint = os.getenv("WREN_ENGINE_ENDPOINT")
         self.remote_function_list_path = os.getenv("REMOTE_FUNCTION_LIST_PATH")
-        self.validate_wren_engine_endpoint(self.wren_engine_endpoint)
+        self.remote_white_function_list_path = os.getenv(
+            "REMOTE_WHITE_FUNCTION_LIST_PATH"
+        )
+        self.app_timeout_seconds = int(os.getenv("APP_TIMEOUT_SECONDS", "240"))
         self.diagnose = False
         self.init_logger()
-
-    @staticmethod
-    def validate_wren_engine_endpoint(endpoint):
-        if endpoint is None:
-            raise ValueError("WREN_ENGINE_ENDPOINT is not set")
 
     @staticmethod
     def init_logger():
@@ -39,6 +37,7 @@ class Config:
             diagnose=False,
             enqueue=True,
         )
+        logger.configure(extra={"correlation_id": "no-correlation"})
 
     @staticmethod
     def logger_diagnose():
@@ -50,6 +49,7 @@ class Config:
             diagnose=True,
             enqueue=True,
         )
+        logger.configure(extra={"correlation_id": "no-correlation"})
 
     def update(self, diagnose: bool):
         self.diagnose = diagnose
@@ -69,8 +69,27 @@ class Config:
             raise ValueError("Invalid data source path")
         return path if os.path.isfile(path) else None
 
+    def get_remote_white_function_list_path(self, data_source: str) -> str:
+        if not self.remote_white_function_list_path:
+            return None
+        else:
+            base_path = os.path.normpath(self.remote_white_function_list_path)
+            path = os.path.normpath(os.path.join(base_path, f"{data_source}.csv"))
+            if not path.startswith(base_path):
+                raise ValueError("Invalid data source path")
+            return path if os.path.isfile(path) else None
+
     def set_remote_function_list_path(self, path: str | None):
         self.remote_function_list_path = path
+
+    def set_remote_white_function_list_path(self, path: str | None):
+        self.remote_white_function_list_path = path
+
+    def get_data_source_is_white_list(self, data_source: str) -> bool:
+        if not self.remote_white_function_list_path:
+            return False
+
+        return data_source in {"bigquery", "postgres"}
 
 
 config = Config()

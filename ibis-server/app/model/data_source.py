@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import base64
 import ssl
+import urllib
 from enum import Enum, StrEnum, auto
 from json import loads
+from typing import Any
+from urllib.parse import unquote_plus
 
 import ibis
 from google.oauth2 import service_account
@@ -15,6 +18,10 @@ from app.model import (
     CannerConnectionInfo,
     ClickHouseConnectionInfo,
     ConnectionInfo,
+    ConnectionUrl,
+    GcsFileConnectionInfo,
+    LocalFileConnectionInfo,
+    MinioFileConnectionInfo,
     MSSqlConnectionInfo,
     MySqlConnectionInfo,
     OracleConnectionInfo,
@@ -35,10 +42,16 @@ from app.model import (
     QueryS3FileDTO,
     QuerySnowflakeDTO,
     QueryTrinoDTO,
+    RedshiftConnectionInfo,
+    RedshiftIAMConnectionInfo,
+    S3FileConnectionInfo,
     SnowflakeConnectionInfo,
     SSLMode,
     TrinoConnectionInfo,
 )
+from app.model.error import ErrorCode, WrenError
+
+X_WREN_DB_STATEMENT_TIMEOUT = "x-wren-db-statement_timeout"
 
 
 class DataSource(StrEnum):
@@ -70,6 +83,126 @@ class DataSource(StrEnum):
         except KeyError:
             raise NotImplementedError(f"Unsupported data source: {self}")
 
+    def get_connection_info(
+        self,
+        data: dict[str, Any] | ConnectionInfo,
+        headers: dict[str, str] | None = None,
+    ) -> ConnectionInfo:
+        """Build a ConnectionInfo object from the provided data and add requried configuration from headers."""
+
+        headers = headers or {}
+        if isinstance(data, ConnectionInfo):
+            info = data
+        else:
+            info = self._build_connection_info(data)
+        match self:
+            case DataSource.postgres:
+                kwargs = info.kwargs if info.kwargs else dict()
+                if not hasattr(info, "connect_timeout"):
+                    kwargs["connect_timeout"] = 120
+
+                options = kwargs.get("options", "")
+                if "statement_timeout" not in options:
+                    if options:
+                        options += " "
+                    options += f"-c statement_timeout={headers.get(X_WREN_DB_STATEMENT_TIMEOUT, 180)}s"
+                    kwargs["options"] = options
+                info.kwargs = kwargs
+            case DataSource.clickhouse:
+                session_timeout = headers.get(X_WREN_DB_STATEMENT_TIMEOUT, 180)
+                if info.settings is None:
+                    info.settings = {}
+                if "max_execution_time" not in info.settings:
+                    info.settings["max_execution_time"] = int(session_timeout)
+            case DataSource.trino:
+                session_timeout = headers.get(X_WREN_DB_STATEMENT_TIMEOUT, 180)
+                if info.kwargs is None:
+                    info.kwargs = {}
+                session_properties = info.kwargs.get("session_properties", {})
+                if "query_max_execution_time" not in session_properties:
+                    session_properties["query_max_execution_time"] = (
+                        f"{session_timeout}s"
+                    )
+                info.kwargs["session_properties"] = session_properties
+        return info
+
+    def _build_connection_info(self, data: dict) -> ConnectionInfo:
+        """Build a ConnectionInfo object from the provided data."""
+        # Check if data contains connectionUrl for connection string-based connections
+        if "connectionUrl" in data or "connection_url" in data:
+            if self == DataSource.clickhouse:
+                return self._handle_clickhouse_url(
+                    urllib.parse.urlparse(
+                        data.get("connectionUrl", data.get("connection_url"))
+                    )
+                )
+            return ConnectionUrl.model_validate(data)
+
+        match self:
+            case DataSource.athena:
+                return AthenaConnectionInfo.model_validate(data)
+            case DataSource.bigquery:
+                return BigQueryConnectionInfo.model_validate(data)
+            case DataSource.canner:
+                return CannerConnectionInfo.model_validate(data)
+            case DataSource.clickhouse:
+                return ClickHouseConnectionInfo.model_validate(data)
+            case DataSource.mssql:
+                return MSSqlConnectionInfo.model_validate(data)
+            case DataSource.mysql:
+                return MySqlConnectionInfo.model_validate(data)
+            case DataSource.oracle:
+                return OracleConnectionInfo.model_validate(data)
+            case DataSource.postgres:
+                return PostgresConnectionInfo.model_validate(data)
+            case DataSource.redshift:
+                if "redshift_type" in data and data["redshift_type"] == "redshift_iam":
+                    return RedshiftIAMConnectionInfo.model_validate(data)
+                return RedshiftConnectionInfo.model_validate(data)
+            case DataSource.snowflake:
+                return SnowflakeConnectionInfo.model_validate(data)
+            case DataSource.trino:
+                return TrinoConnectionInfo.model_validate(data)
+            case DataSource.local_file:
+                return LocalFileConnectionInfo.model_validate(data)
+            case DataSource.s3_file:
+                return S3FileConnectionInfo.model_validate(data)
+            case DataSource.minio_file:
+                return MinioFileConnectionInfo.model_validate(data)
+            case DataSource.gcs_file:
+                return GcsFileConnectionInfo.model_validate(data)
+            case _:
+                raise NotImplementedError(f"Unsupported data source: {self}")
+
+    def _handle_clickhouse_url(
+        self, parsed: urllib.parse.ParseResult
+    ) -> ClickHouseConnectionInfo:
+        if not parsed.scheme or parsed.scheme != "clickhouse":
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                "Invalid connection URL for ClickHouse",
+            )
+        kwargs = {}
+        if parsed.username:
+            kwargs["user"] = parsed.username
+        if parsed.password:
+            kwargs["password"] = unquote_plus(parsed.password)
+        if parsed.hostname:
+            kwargs["host"] = parsed.hostname
+        if parsed.port:
+            kwargs["port"] = str(parsed.port)
+        if database := parsed.path[1:]:
+            kwargs["database"] = database
+        parsed_kwargs = dict(urllib.parse.parse_qsl(parsed.query))
+        if "secure" in parsed_kwargs:
+            kwargs["secure"] = self._safe_strtobool(parsed_kwargs["secure"])
+            parsed_kwargs.pop("secure")
+        kwargs["kwargs"] = parsed_kwargs
+        return ClickHouseConnectionInfo(**kwargs)
+
+    def _safe_strtobool(self, val: str) -> bool:
+        return val.lower() in {"1", "true", "yes", "y"}
+
 
 class DataSourceExtension(Enum):
     athena = QueryAthenaDTO
@@ -94,7 +227,8 @@ class DataSourceExtension(Enum):
     def get_connection(self, info: ConnectionInfo) -> BaseBackend:
         try:
             if hasattr(info, "connection_url"):
-                return ibis.connect(info.connection_url.get_secret_value())
+                kwargs = info.kwargs if info.kwargs else {}
+                return ibis.connect(info.connection_url.get_secret_value(), **kwargs)
             if self.name in {"local_file", "redshift"}:
                 raise NotImplementedError(
                     f"{self.name} connection is not implemented to get ibis backend"
@@ -102,6 +236,10 @@ class DataSourceExtension(Enum):
             return getattr(self, f"get_{self.name}_connection")(info)
         except KeyError:
             raise NotImplementedError(f"Unsupported data source: {self}")
+        except WrenError:
+            raise
+        except Exception as e:
+            raise WrenError(ErrorCode.GET_CONNECTION_ERROR, f"{e!s}") from e
 
     @staticmethod
     def get_athena_connection(info: AthenaConnectionInfo) -> BaseBackend:
@@ -151,6 +289,7 @@ class DataSourceExtension(Enum):
             database=info.database.get_secret_value(),
             user=info.user.get_secret_value(),
             password=(info.password and info.password.get_secret_value()),
+            settings=info.settings if info.settings else dict(),
             **info.kwargs if info.kwargs else dict(),
         )
 
@@ -217,25 +356,37 @@ class DataSourceExtension(Enum):
 
     @staticmethod
     def get_snowflake_connection(info: SnowflakeConnectionInfo) -> BaseBackend:
+        # private key authentication
         if hasattr(info, "private_key") and info.private_key:
-            return ibis.snowflake.connect(
-                user=info.user.get_secret_value(),
-                account=info.account.get_secret_value(),
-                database=info.database.get_secret_value(),
-                schema=info.sf_schema.get_secret_value(),
-                warehouse=info.warehouse.get_secret_value(),
-                private_key=info.private_key.get_secret_value(),
-                **info.kwargs if info.kwargs else dict(),
-            )
+            connection_params = {
+                "user": info.user.get_secret_value(),
+                "private_key": info.private_key.get_secret_value(),
+                "account": info.account.get_secret_value(),
+                "database": info.database.get_secret_value(),
+                "schema": info.sf_schema.get_secret_value(),
+            }
+            # warehouse if it exists and is not None/empty
+            if hasattr(info, "warehouse") and info.warehouse:
+                connection_params["warehouse"] = info.warehouse.get_secret_value()
+            if info.kwargs:
+                connection_params.update(info.kwargs)
+            return ibis.snowflake.connect(**connection_params)
         else:
-            return ibis.snowflake.connect(
-                user=info.user.get_secret_value(),
-                password=info.password.get_secret_value(),
-                account=info.account.get_secret_value(),
-                database=info.database.get_secret_value(),
-                schema=info.sf_schema.get_secret_value(),
-                **info.kwargs if info.kwargs else dict(),
-            )
+            # password authentication
+            connection_params = {
+                "user": info.user.get_secret_value(),
+                "password": info.password.get_secret_value(),
+                "account": info.account.get_secret_value(),
+                "database": info.database.get_secret_value(),
+                "schema": info.sf_schema.get_secret_value(),
+            }
+
+        # warehouse if it exists and is not None/empty
+        if hasattr(info, "warehouse") and info.warehouse:
+            connection_params["warehouse"] = info.warehouse.get_secret_value()
+        if info.kwargs:
+            connection_params.update(info.kwargs)
+        return ibis.snowflake.connect(**connection_params)
 
     @staticmethod
     def get_trino_connection(info: TrinoConnectionInfo) -> BaseBackend:
@@ -258,7 +409,10 @@ class DataSourceExtension(Enum):
         )
 
         if ssl_mode == SSLMode.VERIFY_CA and not info.ssl_ca:
-            raise ValueError("SSL CA must be provided when SSL mode is VERIFY CA")
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                "SSL CA must be provided when SSL mode is VERIFY CA",
+            )
 
         if not ssl_mode or ssl_mode == SSLMode.DISABLED:
             return None
