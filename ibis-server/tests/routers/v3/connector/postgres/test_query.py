@@ -78,7 +78,8 @@ manifest = {
                         "name": "c_name_access",
                         "requiredProperties": [
                             {
-                                "name": "session_level",
+                                # To test the name is case insensitive
+                                "name": "Session_level",
                                 "required": False,
                             }
                         ],
@@ -426,10 +427,9 @@ async def test_query_without_connection_info(client, manifest_str):
     )
     assert response.status_code == 422
     result = response.json()
-    assert result["detail"][0] is not None
-    assert result["detail"][0]["type"] == "missing"
-    assert result["detail"][0]["loc"] == ["body", "connectionInfo"]
-    assert result["detail"][0]["msg"] == "Field required"
+    assert result["errorCode"] == "INVALID_CONNECTION_INFO"
+    assert "connectionInfo" in result["message"]
+    assert "connectionFilePath" in result["message"]
 
 
 async def test_query_with_dry_run(client, manifest_str, connection_info):
@@ -672,13 +672,29 @@ async def test_clac_query(client, manifest_str, connection_info):
             "sql": "SELECT * FROM customer limit 1",
         },
         headers={
-            X_WREN_VARIABLE_PREFIX + "session_level": "2",
+            X_WREN_VARIABLE_PREFIX + "session_level": "1",
         },
     )
     assert response.status_code == 200
     result = response.json()
     assert len(result["data"]) == 1
     assert len(result["data"][0]) == 2
+
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": base64_manifest_with_required_properties,
+            "sql": "SELECT * FROM customer limit 1",
+        },
+        headers={
+            X_WREN_VARIABLE_PREFIX + "session_level": "2",
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["data"]) == 1
+    assert len(result["data"][0]) == 1
 
 
 async def test_connection_timeout(
@@ -782,7 +798,7 @@ SELECT
         9999999999,
         "12304.56",
         "-123.450123",
-        0.000123,
+        "0.000123",
         1.0036585365853659,
         None,  # NaN
         None,  # Infinity
@@ -1219,3 +1235,130 @@ async def test_query_unicode_table(client, connection_info):
         "欄位1": "int32",
         "欄位2": "int32",
     }
+
+
+async def test_case_sensitive_without_quote(client, connection_info):
+    manifest = {
+        "catalog": "wren",
+        "schema": "public",
+        "models": [
+            {
+                "name": "Orders",
+                "tableReference": {
+                    "schema": "public",
+                    "table": "orders",
+                },
+                "columns": [
+                    {
+                        "name": "O_orderkey",
+                        "type": "integer",
+                        "expression": "o_orderkey",
+                    },
+                    {"name": "O_custkey", "type": "integer", "expression": "o_custkey"},
+                ],
+            }
+        ],
+    }
+
+    manifest_str = base64.b64encode(orjson.dumps(manifest)).decode("utf-8")
+
+    response = await client.post(
+        url=f"{base_url}/query?cacheEnable=true",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT O_orderkey, O_custkey FROM Orders LIMIT 1",
+        },
+        headers={X_WREN_FALLBACK_DISABLE: "true"},
+    )
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["dtypes"] == {
+        "O_orderkey": "int32",
+        "O_custkey": "int32",
+    }
+
+
+async def test_to_char_numeric(client, manifest_str, connection_info):
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info,
+            "manifestStr": manifest_str,
+            "sql": "SELECT to_char(1234, '9999') AS formatted_number, to_char(1234.567, '0000.00') AS formatted_double",
+        },
+        headers={X_WREN_FALLBACK_DISABLE: "true"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["data"][0][0] == " 1234"
+    assert result["data"][0][1] == " 1234.57"
+    assert result["dtypes"] == {
+        "formatted_number": "string",
+        "formatted_double": "string",
+    }
+
+
+async def test_connection_info_file(
+    client, manifest_str, connection_info, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CONNECTION_FILE_ROOT", str(tmp_path))
+    conn_file = tmp_path / "connection.json"
+    conn_file.write_bytes(orjson.dumps(connection_info))
+
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionFilePath": str(conn_file),
+            "manifestStr": manifest_str,
+            "sql": "SELECT * FROM wren.public.orders LIMIT 1",
+        },
+        headers={X_WREN_FALLBACK_DISABLE: "true"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert len(result["columns"]) == 10
+    assert len(result["data"]) == 1
+
+
+async def test_connection_info_file_with_integer_port(
+    client, manifest_str, connection_info, tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CONNECTION_FILE_ROOT", str(tmp_path))
+    conn_file = tmp_path / "connection.json"
+    conn_file.write_bytes(
+        orjson.dumps({**connection_info, "port": int(connection_info["port"])})
+    )
+
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionFilePath": str(conn_file),
+            "manifestStr": manifest_str,
+            "sql": "SELECT 1 AS result",
+        },
+        headers={X_WREN_FALLBACK_DISABLE: "true"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["data"][0][0] == 1
+
+
+async def test_connection_info_port_as_integer(client, manifest_str, connection_info):
+    connection_info_with_int_port = {
+        **connection_info,
+        "port": int(connection_info["port"]),
+    }
+    response = await client.post(
+        url=f"{base_url}/query",
+        json={
+            "connectionInfo": connection_info_with_int_port,
+            "manifestStr": manifest_str,
+            "sql": "SELECT 1 AS result",
+        },
+        headers={X_WREN_FALLBACK_DISABLE: "true"},
+    )
+    assert response.status_code == 200
+    result = response.json()
+    assert result["data"][0][0] == 1

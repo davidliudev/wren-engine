@@ -110,10 +110,8 @@ pub fn create_wren_calculated_field_expr(
     // Remove all relationship fields from the expression. Only keep the target expression and its source table.
     let expr = column_rf.column.expression.clone().unwrap();
     let session_state = session_state.read();
-    let mut expr = session_state.sql_to_expr(
-        &expr,
-        session_state.config_options().sql_parser.dialect.as_str(),
-    )?;
+    let mut expr = session_state
+        .sql_to_expr(&expr, &session_state.config_options().sql_parser.dialect)?;
     let _ = visit_expressions_mut(&mut expr, |e| {
         if let CompoundIdentifier(ids) = e {
             let name_size = ids.len();
@@ -130,7 +128,7 @@ pub fn create_wren_calculated_field_expr(
         .map(|m| analyzed_wren_mdl.wren_mdl().get_model(&m))
         .filter(|m| m.is_some())
         .map(|m| Dataset::Model(m.unwrap()))
-        .map(|m| m.to_qualified_schema())
+        .map(|m| m.to_qualified_schema(true))
         .reduce(|acc, schema| acc?.join(&schema?))
         .transpose()?
     else {
@@ -163,7 +161,7 @@ pub(crate) fn create_wren_expr_for_model(
     session_state: SessionStateRef,
 ) -> Result<Expr> {
     let dataset = Dataset::Model(model);
-    let schema = dataset.to_qualified_schema()?;
+    let schema = dataset.to_qualified_schema(true)?;
     let session_state = session_state.read();
     session_state.create_logical_expr(
         qualified_expr(expr, &schema, &session_state)?.as_str(),
@@ -177,10 +175,8 @@ fn qualified_expr(
     schema: &DFSchema,
     session_state: &SessionState,
 ) -> Result<String> {
-    let mut expr = session_state.sql_to_expr(
-        expr,
-        session_state.config_options().sql_parser.dialect.as_str(),
-    )?;
+    let mut expr = session_state
+        .sql_to_expr(expr, &session_state.config_options().sql_parser.dialect)?;
     let _ = visit_expressions_mut(&mut expr, |e| {
         if let Identifier(id) = e {
             if let Ok((Some(qualifier), _)) =
@@ -210,6 +206,16 @@ pub fn quoted(s: &str) -> String {
     format!("\"{s}\"")
 }
 
+#[inline]
+pub fn dequote_identifier(s: &str) -> &str {
+    // Require >= 2 chars so a single `"` doesn't slice 1..0 and panic.
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        &s[1..s.len() - 1]
+    } else {
+        s
+    }
+}
+
 /// Transform the column to a datafusion field
 pub fn to_field(column: &wren_core_base::mdl::Column) -> Result<Field> {
     let data_type = try_map_data_type(&column.r#type)?;
@@ -225,7 +231,7 @@ pub fn to_remote_field(
         let session_state = session_state.read();
         let expr = session_state.sql_to_expr(
             column.expression().unwrap(),
-            session_state.config_options().sql_parser.dialect.as_str(),
+            &session_state.config_options().sql_parser.dialect,
         )?;
         let columns = collect_columns(expr);
         columns

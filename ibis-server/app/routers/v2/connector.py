@@ -18,6 +18,7 @@ from app.mdl.java_engine import JavaEngineConnector
 from app.mdl.rewriter import Rewriter
 from app.mdl.substitute import ModelSubstitute
 from app.model import (
+    BigQueryProjectConnectionInfo,
     DryPlanDTO,
     QueryDTO,
     TranspileDTO,
@@ -25,7 +26,12 @@ from app.model import (
 )
 from app.model.connector import Connector
 from app.model.data_source import DataSource
-from app.model.metadata.dto import Constraint, MetadataDTO, Table
+from app.model.error import ErrorCode, WrenError
+from app.model.metadata.dto import (
+    Constraint,
+    Table,
+    V2MetadataDTO,
+)
 from app.model.metadata.factory import MetadataFactory
 from app.model.validator import Validator
 from app.query_cache import QueryCacheManager
@@ -39,6 +45,7 @@ from app.util import (
     execute_validate_with_timeout,
     get_fallback_message,
     pushdown_limit,
+    resolve_connection_info,
     set_attribute,
     to_json,
     update_response_headers,
@@ -87,7 +94,7 @@ async def query(
     if cache_enable:
         span_name += "_cache_enable"
     connection_info = data_source.get_connection_info(
-        dto.connection_info, dict(headers)
+        resolve_connection_info(dto), dict(headers)
     )
     # Convert headers to dict for cache manager
     headers_dict = dict(headers) if headers else None
@@ -156,41 +163,46 @@ async def query(
             # headers for all non-hit cases
             cache_headers[X_CACHE_HIT] = "false"
 
-            match (cache_enable, cache_hit, override_cache):
-                # case 2 cache hit but override cache
-                case (True, True, True):
-                    cache_headers[X_CACHE_CREATE_AT] = str(
-                        query_cache_manager.get_cache_file_timestamp(
-                            data_source, dto.sql, connection_info, headers_dict
-                        )
-                    )
-                    query_cache_manager.set(
+            # case 2 cache hit but override cache
+            if cache_enable and cache_hit and override_cache:
+                cache_headers[X_CACHE_CREATE_AT] = str(
+                    query_cache_manager.get_cache_file_timestamp(
                         data_source,
                         dto.sql,
-                        result,
                         connection_info,
                         headers_dict,
                     )
+                )
+                query_cache_manager.set(
+                    data_source,
+                    dto.sql,
+                    result,
+                    connection_info,
+                    headers_dict,
+                )
 
-                    cache_headers[X_CACHE_OVERRIDE] = "true"
-                    cache_headers[X_CACHE_OVERRIDE_AT] = str(
-                        query_cache_manager.get_cache_file_timestamp(
-                            data_source, dto.sql, connection_info, headers_dict
-                        )
-                    )
-                # case 3/4: cache miss but enabled (need to create cache)
-                # no matter the cache override or not, we need to create cache
-                case (True, False, _):
-                    query_cache_manager.set(
+                cache_headers[X_CACHE_OVERRIDE] = "true"
+                cache_headers[X_CACHE_OVERRIDE_AT] = str(
+                    query_cache_manager.get_cache_file_timestamp(
                         data_source,
                         dto.sql,
-                        result,
                         connection_info,
                         headers_dict,
                     )
-                # case 5~8 Other cases (cache is not enabled)
-                case (False, _, _):
-                    pass
+                )
+            # case 3/4: cache miss but enabled (need to create cache)
+            # no matter the cache override or not, we need to create cache
+            elif cache_enable and not cache_hit:
+                query_cache_manager.set(
+                    data_source,
+                    dto.sql,
+                    result,
+                    connection_info,
+                    headers_dict,
+                )
+            # case 5~8 Other cases (cache is not enabled)
+            elif not cache_enable:
+                pass
         response = ORJSONResponse(to_json(result, headers, data_source=data_source))
         update_response_headers(response, cache_headers)
 
@@ -221,7 +233,7 @@ async def validate(
     ) as span:
         set_attribute(headers, span)
         connection_info = data_source.get_connection_info(
-            dto.connection_info, dict(headers)
+            resolve_connection_info(dto), dict(headers)
         )
         validator = Validator(
             Connector(data_source, connection_info),
@@ -253,7 +265,7 @@ async def validate(
 )
 async def get_table_list(
     data_source: DataSource,
-    dto: MetadataDTO,
+    dto: V2MetadataDTO,
     headers: Annotated[Headers, Depends(get_wren_headers)] = None,
 ) -> list[Table]:
     span_name = f"v2_metadata_tables_{data_source}"
@@ -262,10 +274,16 @@ async def get_table_list(
     ) as span:
         set_attribute(headers, span)
         connection_info = data_source.get_connection_info(
-            dto.connection_info, dict(headers)
+            resolve_connection_info(dto), dict(headers)
         )
-        metadata = MetadataFactory.get_metadata(data_source, connection_info)
-        return await execute_get_table_list_with_timeout(metadata)
+        if isinstance(connection_info, BigQueryProjectConnectionInfo):
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                "BigQuery project-level connection info is only supported by v3 API for metadata table list retrieval.",
+            )
+        else:
+            metadata = MetadataFactory.get_metadata(data_source, connection_info)
+            return await execute_get_table_list_with_timeout(metadata)
 
 
 @router.post(
@@ -276,7 +294,7 @@ async def get_table_list(
 )
 async def get_constraints(
     data_source: DataSource,
-    dto: MetadataDTO,
+    dto: V2MetadataDTO,
     headers: Annotated[Headers, Depends(get_wren_headers)] = None,
 ) -> list[Constraint]:
     span_name = f"v2_metadata_constraints_{data_source}"
@@ -285,8 +303,13 @@ async def get_constraints(
     ) as span:
         set_attribute(headers, span)
         connection_info = data_source.get_connection_info(
-            dto.connection_info, dict(headers)
+            resolve_connection_info(dto), dict(headers)
         )
+        if isinstance(connection_info, BigQueryProjectConnectionInfo):
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                "BigQuery project-level connection info is only supported by v3 API for metadata constraints retrieval.",
+            )
         metadata = MetadataFactory.get_metadata(data_source, connection_info)
         return await execute_get_constraints_with_timeout(metadata)
 
@@ -298,11 +321,11 @@ async def get_constraints(
 )
 async def get_db_version(
     data_source: DataSource,
-    dto: MetadataDTO,
+    dto: V2MetadataDTO,
     headers: Annotated[Headers, Depends(get_wren_headers)] = None,
 ) -> str:
     connection_info = data_source.get_connection_info(
-        dto.connection_info, dict(headers)
+        resolve_connection_info(dto), dict(headers)
     )
     metadata = MetadataFactory.get_metadata(data_source, connection_info)
     return await execute_get_version_with_timeout(metadata)
@@ -376,7 +399,7 @@ async def model_substitute(
     ) as span:
         set_attribute(headers, span)
         connection_info = data_source.get_connection_info(
-            dto.connection_info, dict(headers)
+            resolve_connection_info(dto), dict(headers)
         )
         sql = ModelSubstitute(data_source, dto.manifest_str, headers).substitute(
             dto.sql, write="trino"

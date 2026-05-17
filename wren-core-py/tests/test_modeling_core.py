@@ -17,7 +17,7 @@ from wren_core import (
 manifest = {
     "catalog": "my_catalog",
     "schema": "my_schema",
-    "dataSource": "bigquery",
+    "dataSource": "datafusion",
     "models": [
         {
             "name": "customer",
@@ -121,7 +121,7 @@ def test_session_context():
     rewritten_sql = session_context.transform_sql(sql)
     assert (
         rewritten_sql
-        == "SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM main.customer AS __source) AS customer) AS customer"
+        == 'SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM "main".customer AS __source) AS customer) AS customer'
     )
 
     session_context = SessionContext(manifest_str, "tests/functions.csv")
@@ -129,7 +129,7 @@ def test_session_context():
     rewritten_sql = session_context.transform_sql(sql)
     assert (
         rewritten_sql
-        == "SELECT add_two(customer.c_custkey, customer.c_custkey) FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM main.customer AS __source) AS customer) AS customer"
+        == 'SELECT add_two(customer.c_custkey, customer.c_custkey) FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM "main".customer AS __source) AS customer) AS customer'
     )
 
 
@@ -137,19 +137,19 @@ def test_read_function_list():
     path = "tests/functions.csv"
     session_context = SessionContext(manifest_str, path)
     functions = session_context.get_available_functions()
-    assert len(functions) == 292
+    assert len(functions) == 290
 
     rewritten_sql = session_context.transform_sql(
         "SELECT add_two(c_custkey, c_custkey) FROM my_catalog.my_schema.customer"
     )
     assert (
         rewritten_sql
-        == "SELECT add_two(customer.c_custkey, customer.c_custkey) FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM main.customer AS __source) AS customer) AS customer"
+        == 'SELECT add_two(customer.c_custkey, customer.c_custkey) FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM "main".customer AS __source) AS customer) AS customer'
     )
 
     session_context = SessionContext(manifest_str, None)
     functions = session_context.get_available_functions()
-    assert len(functions) == 285
+    assert len(functions) == 283
 
 
 def test_get_available_functions():
@@ -260,7 +260,7 @@ def test_extract_by(dataset, expected_models):
     extracted_manifest = ManifestExtractor(manifest_str).extract_by(dataset)
     assert len(extracted_manifest.models) == len(expected_models)
     assert [m.name for m in extracted_manifest.models] == expected_models
-    assert extracted_manifest.data_source.__str__() == "DataSource.BigQuery"
+    assert extracted_manifest.data_source.__str__() == "DataSource.Datafusion"
 
 
 def test_to_json_base64():
@@ -316,7 +316,7 @@ def test_rlac():
     rewritten_sql = session_context.transform_sql(sql)
     assert (
         rewritten_sql
-        == "SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM main.customer AS __source) AS customer) AS customer WHERE customer.c_name = 'test_user') AS customer"
+        == 'SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM "main".customer AS __source) AS customer) AS customer WHERE customer.c_name = \'test_user\') AS customer'
     )
 
 
@@ -377,7 +377,7 @@ def test_clac():
     rewritten_sql = session_context.transform_sql(sql)
     assert (
         rewritten_sql
-        == "SELECT customer.c_custkey FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM main.customer AS __source) AS customer) AS customer"
+        == 'SELECT customer.c_custkey FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM "main".customer AS __source) AS customer) AS customer'
     )
 
     session_context = SessionContext(manifest_str, None, properties_hashable)
@@ -549,3 +549,42 @@ def test_backward_compatible_check():
         json.dumps(manifest_backward).encode("utf-8")
     ).decode("utf-8")
     assert is_backward_compatible(manifest_backward_str)
+
+
+def test_case_sensitive_without_quote():
+    manifest = {
+        "catalog": "my_catalog",
+        "schema": "my_schema",
+        "dataSource": "mysql",
+        "models": [
+            {
+                "name": "Orders",
+                "tableReference": {
+                    "schema": "main",
+                    "table": "orders",
+                },
+                "columns": [
+                    {"name": "O_orderkey", "type": "integer"},
+                    {"name": "O_custkey", "type": "integer"},
+                    {"name": "O_orderdate", "type": "date"},
+                ],
+            },
+        ],
+    }
+    manifest_str = base64.b64encode(json.dumps(manifest).encode("utf-8")).decode(
+        "utf-8"
+    )
+    sql = "select O_orderkey, O_custkey, O_orderdate from Orders"
+    extractor = ManifestExtractor(manifest_str)
+    tables = extractor.resolve_used_table_names(sql)
+    assert tables == ["Orders"]
+
+    extracted_manifest = extractor.extract_by(tables)
+    encoded_str = to_json_base64(extracted_manifest)
+
+    session_context = SessionContext(encoded_str, None)
+    actual = session_context.transform_sql(sql)
+    assert (
+        actual
+        == 'SELECT "Orders"."O_orderkey", "Orders"."O_custkey", "Orders"."O_orderdate" FROM (SELECT "Orders"."O_custkey", "Orders"."O_orderdate", "Orders"."O_orderkey" FROM (SELECT __source."O_custkey" AS "O_custkey", __source."O_orderdate" AS "O_orderdate", __source."O_orderkey" AS "O_orderkey" FROM "main".orders AS __source) AS "Orders") AS "Orders"'
+    )

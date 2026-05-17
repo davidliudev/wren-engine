@@ -200,12 +200,12 @@ async def test_query(client, manifest_str, oracle: OracleDbContainer):
     assert result["dtypes"] == {
         "orderkey": "int64",
         "custkey": "int64",
-        "orderstatus": "string",
-        "totalprice": "decimal128(38, 9)",
+        "orderstatus": "large_string",
+        "totalprice": "decimal128(38, 2)",
         "orderdate": "date32[day]",
         "order_cust_key": "string",
-        "timestamp": "timestamp[ns]",
-        "timestamptz": "timestamp[ns, tz=UTC]",
+        "timestamp": "timestamp[us]",
+        "timestamptz": "timestamp[us, tz=UTC]",
         "test_null_time": "timestamp[us]",
         "blob_column": "binary",
     }
@@ -277,10 +277,9 @@ async def test_query_without_connection_info(
     )
     assert response.status_code == 422
     result = response.json()
-    assert result["detail"][0] is not None
-    assert result["detail"][0]["type"] == "missing"
-    assert result["detail"][0]["loc"] == ["body", "connectionInfo"]
-    assert result["detail"][0]["msg"] == "Field required"
+    assert result["errorCode"] == "INVALID_CONNECTION_INFO"
+    assert "connectionInfo" in result["message"]
+    assert "connectionFilePath" in result["message"]
 
 
 async def test_query_with_dry_run(client, manifest_str, oracle: OracleDbContainer):
@@ -311,9 +310,9 @@ async def test_query_with_dry_run_and_invalid_sql(
         },
     )
     assert response.status_code == 422
-    assert (
-        "ORA-00942" in response.text
-    )  # Oracle ORA-00942 Error: Table or view does not exist
+    body = response.json()
+    assert body["errorCode"] == "INVALID_SQL"
+    assert "ORA-00942" in body["message"]
 
 
 async def test_metadata_list_tables(client, oracle: OracleDbContainer):

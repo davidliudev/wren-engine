@@ -7,6 +7,7 @@ from loguru import logger
 from opentelemetry import trace
 
 from app.config import get_config
+from app.custom_sqlglot.dialects.wren import Wren
 from app.dependencies import X_WREN_VARIABLE_PREFIX
 from app.mdl.core import (
     get_manifest_extractor,
@@ -41,7 +42,9 @@ class Rewriter:
         self.properties = properties
         if experiment:
             function_path = get_config().get_remote_function_list_path(data_source)
-            self._rewriter = EmbeddedEngineRewriter(function_path)
+            self._rewriter = EmbeddedEngineRewriter(
+                function_path=function_path, data_source=data_source
+            )
         else:
             self._rewriter = ExternalEngineRewriter(java_engine_connector)
 
@@ -82,8 +85,8 @@ class Rewriter:
             self._rewriter.handle_extract_exception(e)
 
     @classmethod
-    def _get_read_dialect(cls, experiment) -> str | None:
-        return None if experiment else "trino"
+    def _get_read_dialect(cls, experiment) -> str | sqlglot.Dialect:
+        return Wren if experiment else "trino"
 
     @classmethod
     def _get_write_dialect(cls, data_source: DataSource) -> str:
@@ -129,7 +132,8 @@ class ExternalEngineRewriter:
 
 
 class EmbeddedEngineRewriter:
-    def __init__(self, function_path: str):
+    def __init__(self, function_path: str, data_source: DataSource = None):
+        self.data_source = data_source
         self.function_path = function_path
 
     @tracer.start_as_current_span("embedded_rewrite", kind=trace.SpanKind.INTERNAL)
@@ -139,7 +143,10 @@ class EmbeddedEngineRewriter:
         try:
             processed_properties = self.get_session_properties(properties)
             session_context = get_session_context(
-                manifest_str, self.function_path, processed_properties
+                manifest_str,
+                self.function_path,
+                processed_properties,
+                self.data_source.name if self.data_source else None,
             )
             return await to_thread.run_sync(
                 session_context.transform_sql,
@@ -150,12 +157,18 @@ class EmbeddedEngineRewriter:
 
     @tracer.start_as_current_span("embedded_rewrite", kind=trace.SpanKind.INTERNAL)
     def rewrite_sync(
-        self, manifest_str: str, sql: str, properties: dict | None = None
+        self,
+        manifest_str: str,
+        sql: str,
+        properties: dict | None = None,
     ) -> str:
         try:
             processed_properties = self.get_session_properties(properties)
             session_context = get_session_context(
-                manifest_str, self.function_path, processed_properties
+                manifest_str,
+                self.function_path,
+                processed_properties,
+                self.data_source.name if self.data_source else None,
             )
             return session_context.transform_sql(sql)
         except Exception as e:

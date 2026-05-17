@@ -96,12 +96,12 @@ pub fn validate_rlac_rule(rule: &RowLevelAccessControl, model: &Model) -> Result
 
     let required_properties: Vec<_> = required_properties
         .iter()
-        .map(|property| property.name.to_lowercase())
+        .map(|property| property.normalized_name())
         .collect();
 
     let missed_properties: Vec<_> = session_properties
         .iter()
-        .filter(|property| !required_properties.contains(property))
+        .filter(|property| !required_properties.contains(&property.as_str()))
         .collect();
     if !missed_properties.is_empty() {
         return plan_err!(
@@ -131,7 +131,7 @@ pub fn build_filter_expression(
     } = rule;
     let mut error: Option<Result<Expr, DataFusionError>> = None;
     let dialect = GenericDialect {};
-    let mut parser = DFParserBuilder::new(condition)
+    let mut parser = DFParserBuilder::new(condition.as_str())
         .with_dialect(&dialect)
         .build()?;
     let mut expr = parser.parse_expr()?;
@@ -144,9 +144,7 @@ pub fn build_filter_expression(
                 let Some(property_value) = properties.get(&property_name).or_else(|| {
                     required_properties
                         .iter()
-                        .filter(|r| {
-                            !r.required && r.name.eq_ignore_ascii_case(&property_name)
-                        })
+                        .filter(|r| !r.required && r.normalized_name().eq(&property_name))
                         .map(|r| &r.default_expr)
                         .next()
                 }) else {
@@ -198,7 +196,8 @@ pub fn build_filter_expression(
     if let Some(error) = error {
         return error;
     }
-    let df_schema = Dataset::Model(Arc::clone(&model)).to_qualified_schema()?;
+    // The condition could contains the hidden columns, so we need to build the shcmea with hidden columns
+    let df_schema = Dataset::Model(Arc::clone(&model)).to_qualified_schema(false)?;
     session_state
         .read()
         .create_logical_expr(&expr.to_string(), &df_schema)
@@ -253,11 +252,15 @@ pub fn validate_rule(
     required_properties: &[SessionProperty],
     headers: &HashMap<String, Option<String>>,
 ) -> Result<bool> {
+    if required_properties.is_empty() {
+        return Ok(true);
+    }
+
     let exists = required_properties
         .iter()
         .map(|property| {
             if property.required {
-                if !is_property_present(headers, &property.name) {
+                if !is_property_present(headers, property) {
                     return plan_err!(
                         "session property {} is required for `{}` rule but not found in headers",
                         property.name,
@@ -266,7 +269,7 @@ pub fn validate_rule(
                 }
                 Ok(true)
             } else {
-                let exist = is_property_present(headers, &property.name);
+                let exist = is_property_present(headers, property);
                 if exist
                     || property
                         .default_expr
@@ -303,7 +306,7 @@ pub(crate) fn validate_clac_rule(
         }
 
         let property = &clac.required_properties[0];
-        let value_opt = properties.get(&property.name);
+        let value_opt = properties.get(property.normalized_name());
 
         match value_opt {
             Some(Some(value)) => (clac.eval(value), Some(clac.name.clone())),
@@ -336,7 +339,7 @@ pub(crate) fn validate_clac_rule(
                 else {
                     return plan_err!("Model {} not found", model_name.table());
                 };
-                let Some(ref_column) = ref_model.get_column(field.name()) else {
+                let Some(ref_column) = ref_model.get_visible_column(field.name()) else {
                     return plan_err!(
                         "Column {}.{} not found",
                         model_name.table(),
@@ -363,10 +366,10 @@ pub(crate) fn validate_clac_rule(
 /// If the property is present and not empty, return true.
 fn is_property_present(
     headers: &HashMap<String, Option<String>>,
-    property_name: &str,
+    property: &SessionProperty,
 ) -> bool {
     headers
-        .get(&property_name.to_lowercase())
+        .get(property.normalized_name())
         .map(|v| v.as_ref().is_some_and(|value| !value.is_empty()))
         .unwrap_or(false)
 }

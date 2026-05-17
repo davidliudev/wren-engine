@@ -3,10 +3,16 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Any, Literal, Union
 
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, BeforeValidator, Field, SecretStr, model_validator
+
+from app.model.error import ErrorCode, WrenError
+
+SecretPort = Annotated[
+    SecretStr, BeforeValidator(lambda v: str(v) if isinstance(v, int) else v)
+]
 
 manifest_str_field = Field(alias="manifestStr", description="Base64 manifest")
-connection_info_field = Field(alias="connectionInfo")
+connection_info_field = Field(alias="connectionInfo", default=None)
 
 
 class BaseConnectionInfo(BaseModel):
@@ -24,11 +30,21 @@ class BaseConnectionInfo(BaseModel):
 class QueryDTO(BaseModel):
     sql: str
     manifest_str: str = manifest_str_field
-    connection_info: dict[str, Any] | ConnectionInfo = connection_info_field
+    connection_info: dict[str, Any] | ConnectionInfo | None = connection_info_field
+    connection_file_path: str | None = Field(alias="connectionFilePath", default=None)
+
+    @model_validator(mode="after")
+    def check_connection_source(self):
+        if self.connection_info is None and self.connection_file_path is None:
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                "Either connectionInfo or connectionFilePath must be provided",
+            )
+        return self
 
 
 class QueryBigQueryDTO(QueryDTO):
-    connection_info: BigQueryConnectionInfo = connection_info_field
+    connection_info: BigQueryConnectionUnion = connection_info_field
 
 
 class QueryAthenaDTO(QueryDTO):
@@ -51,6 +67,10 @@ class QueryMySqlDTO(QueryDTO):
     connection_info: ConnectionUrl | MySqlConnectionInfo = connection_info_field
 
 
+class QueryDorisDTO(QueryDTO):
+    connection_info: DorisConnectionInfo = connection_info_field
+
+
 class QueryOracleDTO(QueryDTO):
     connection_info: ConnectionUrl | OracleConnectionInfo = connection_info_field
 
@@ -67,11 +87,23 @@ class QuerySnowflakeDTO(QueryDTO):
     connection_info: SnowflakeConnectionInfo = connection_info_field
 
 
+class QueryDatabricksDTO(QueryDTO):
+    connection_info: DatabricksConnectionUnion = connection_info_field
+
+
+class QuerySparkDTO(QueryDTO):
+    connection_info: SparkConnectionInfo = connection_info_field
+
+
 class QueryTrinoDTO(QueryDTO):
     connection_info: ConnectionUrl | TrinoConnectionInfo = connection_info_field
 
 
 class QueryLocalFileDTO(QueryDTO):
+    connection_info: LocalFileConnectionInfo = connection_info_field
+
+
+class QueryDuckDBDTO(QueryDTO):
     connection_info: LocalFileConnectionInfo = connection_info_field
 
 
@@ -96,13 +128,62 @@ class ConnectionUrl(BaseConnectionInfo):
 
 
 class BigQueryConnectionInfo(BaseConnectionInfo):
+    credentials: SecretStr = Field(
+        description="Base64 encode `credentials.json`", examples=["eyJ..."]
+    )
+    job_timeout_ms: int | None = Field(
+        description="Job timeout in milliseconds. If the job is not complete within the specified time, it will be cancelled.",
+        default=None,
+    )
+
+    def get_billing_project_id(self) -> str | None:
+        raise WrenError(
+            ErrorCode.NOT_IMPLEMENTED,
+            "get_billing_project_id not implemented by base class",
+        )
+
+
+class BigQueryDatasetConnectionInfo(BigQueryConnectionInfo):
+    bigquery_type: Literal["dataset"] = "dataset"
     project_id: SecretStr = Field(description="GCP project id", examples=["my-project"])
     dataset_id: SecretStr = Field(
         description="BigQuery dataset id", examples=["my_dataset"]
     )
-    credentials: SecretStr = Field(
-        description="Base64 encode `credentials.json`", examples=["eyJ..."]
+
+    def get_billing_project_id(self):
+        return self.project_id.get_secret_value()
+
+    def __hash__(self):
+        return hash((self.project_id, self.dataset_id, self.credentials))
+
+
+class BigQueryProjectConnectionInfo(BigQueryConnectionInfo):
+    bigquery_type: Literal["project"] = "project"
+    region: SecretStr = Field(
+        description="the region of your BigQuery connection", examples=["US"]
     )
+    billing_project_id: SecretStr = Field(
+        description="the billing project id of your BigQuery connection",
+        examples=["billing-project-1"],
+    )
+
+    def get_billing_project_id(self):
+        return self.billing_project_id.get_secret_value()
+
+    def __hash__(self):
+        return hash(
+            (
+                self.region,
+                self.billing_project_id,
+                self.credentials,
+            )
+        )
+
+
+BigQueryConnectionUnion = Annotated[
+    Union[BigQueryDatasetConnectionInfo, BigQueryProjectConnectionInfo],
+    Field(discriminator="bigquery_type", default="dataset"),
+]
 
 
 class AthenaConnectionInfo(BaseConnectionInfo):
@@ -110,19 +191,55 @@ class AthenaConnectionInfo(BaseConnectionInfo):
         description="S3 staging directory for Athena queries",
         examples=["s3://my-bucket/athena-staging/"],
     )
-    aws_access_key_id: SecretStr = Field(
-        description="AWS access key ID", examples=["AKIA..."]
+
+    # ── Standard AWS credential chain (optional) ─────────────
+    aws_access_key_id: SecretStr | None = Field(
+        description="AWS access key ID. Optional if using IAM role, web identity token, or default credential chain.",
+        examples=["AKIA..."],
+        default=None,
     )
-    aws_secret_access_key: SecretStr = Field(
-        description="AWS secret access key", examples=["my-secret-key"]
+    aws_secret_access_key: SecretStr | None = Field(
+        description="AWS secret access key. Optional if using IAM role, web identity token, or default credential chain.",
+        examples=["my-secret-key"],
+        default=None,
     )
+    aws_session_token: SecretStr | None = Field(
+        description="AWS session token (used for temporary credentials)",
+        examples=["IQoJb3JpZ2luX2VjEJz//////////wEaCXVzLWVhc3QtMSJHMEUCIQD..."],
+        default=None,
+    )
+
+    # ── Web identity federation (OIDC/JWT-based) ─────────────
+    web_identity_token: SecretStr | None = Field(
+        description=(
+            "OIDC web identity token (JWT) used for AssumeRoleWithWebIdentity authentication. "
+            "If provided, PyAthena will call STS to exchange it for temporary credentials."
+        ),
+        examples=["eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."],
+        default=None,
+    )
+    role_arn: SecretStr | None = Field(
+        description="The ARN of the role to assume with the web identity token.",
+        examples=["arn:aws:iam::123456789012:role/YourAthenaRole"],
+        default=None,
+    )
+    role_session_name: SecretStr | None = Field(
+        description="The session name when assuming a role (optional).",
+        examples=["PyAthena-session"],
+        default=None,
+    )
+
+    # ── Regional and database settings ───────────────────────
     region_name: SecretStr = Field(
-        description="AWS region for Athena", examples=["us-west-2", "us-east-1"]
+        description="AWS region for Athena. Optional; will use default region if not provided.",
+        examples=["us-west-2", "us-east-1"],
+        default=None,
     )
-    schema_name: SecretStr = Field(
+    schema_name: SecretStr | None = Field(
         alias="schema_name",
-        description="The database name in Athena",
+        description="The database name in Athena. Defaults to 'default'.",
         examples=["default"],
+        default=SecretStr("default"),
     )
 
 
@@ -130,7 +247,7 @@ class CannerConnectionInfo(BaseConnectionInfo):
     host: SecretStr = Field(
         description="the hostname of your database", examples=["localhost"]
     )
-    port: SecretStr = Field(description="the port of your database", examples=["8080"])
+    port: SecretPort = Field(description="the port of your database", examples=["8080"])
     user: SecretStr = Field(
         description="the username of your database", examples=["admin"]
     )
@@ -149,7 +266,7 @@ class ClickHouseConnectionInfo(BaseConnectionInfo):
     host: SecretStr = Field(
         description="the hostname of your database", examples=["localhost"]
     )
-    port: SecretStr = Field(description="the port of your database", examples=["8123"])
+    port: SecretPort = Field(description="the port of your database", examples=["8123"])
     database: SecretStr = Field(
         description="the database name of your database", examples=["default"]
     )
@@ -178,7 +295,7 @@ class MSSqlConnectionInfo(BaseConnectionInfo):
     host: SecretStr = Field(
         description="the hostname of your database", examples=["localhost"]
     )
-    port: SecretStr = Field(description="the port of your database", examples=["1433"])
+    port: SecretPort = Field(description="the port of your database", examples=["1433"])
     database: SecretStr = Field(
         description="the database name of your database", examples=["master"]
     )
@@ -203,7 +320,7 @@ class MySqlConnectionInfo(BaseConnectionInfo):
     host: SecretStr = Field(
         description="the hostname of your database", examples=["localhost"]
     )
-    port: SecretStr = Field(description="the port of your database", examples=["3306"])
+    port: SecretPort = Field(description="the port of your database", examples=["3306"])
     database: SecretStr = Field(
         description="the database name of your database", examples=["default"]
     )
@@ -227,11 +344,34 @@ class MySqlConnectionInfo(BaseConnectionInfo):
     )
 
 
+class DorisConnectionInfo(BaseConnectionInfo):
+    host: SecretStr = Field(
+        description="the hostname of your Doris FE", examples=["localhost"]
+    )
+    port: SecretStr = Field(
+        description="the query port of your Doris FE", examples=["9030"]
+    )
+    database: SecretStr = Field(
+        description="the database name of your Doris database", examples=["default"]
+    )
+    user: SecretStr = Field(
+        description="the username of your Doris database", examples=["root"]
+    )
+    password: SecretStr | None = Field(
+        description="the password of your Doris database",
+        examples=["password"],
+        default=None,
+    )
+    kwargs: dict[str, str] | None = Field(
+        description="Additional keyword arguments to pass to PyMySQL", default=None
+    )
+
+
 class PostgresConnectionInfo(BaseConnectionInfo):
     host: SecretStr = Field(
         examples=["localhost"], description="the hostname of your database"
     )
-    port: SecretStr = Field(examples=[5432], description="the port of your database")
+    port: SecretPort = Field(examples=["5432"], description="the port of your database")
     database: SecretStr = Field(
         examples=["postgres"], description="the database name of your database"
     )
@@ -253,7 +393,7 @@ class OracleConnectionInfo(BaseConnectionInfo):
         description="the hostname of your database",
         default="localhost",
     )
-    port: SecretStr = Field(
+    port: SecretPort = Field(
         examples=[1521], description="the port of your database", default="1521"
     )
     database: SecretStr = Field(
@@ -279,7 +419,7 @@ class RedshiftConnectionInfo(BaseConnectionInfo):
     host: SecretStr = Field(
         description="the hostname of your database", examples=["localhost"]
     )
-    port: SecretStr = Field(description="the port of your database", examples=["5439"])
+    port: SecretPort = Field(description="the port of your database", examples=["5439"])
     database: SecretStr = Field(
         description="the database name of your database", examples=["dev"]
     )
@@ -356,11 +496,75 @@ class SnowflakeConnectionInfo(BaseConnectionInfo):
     )
 
 
+class SparkConnectionInfo(BaseConnectionInfo):
+    host: SecretStr = Field(
+        description="Spark Connect server hostname",
+        examples=["localhost", "spark-connect.mycompany.internal"],
+    )
+    port: SecretPort = Field(description="the port of your spark connect server")
+
+
+class DatabricksTokenConnectionInfo(BaseConnectionInfo):
+    databricks_type: Literal["token"] = "token"
+    server_hostname: SecretStr = Field(
+        alias="serverHostname",
+        description="the server hostname of your Databricks instance",
+        examples=["dbc-xxxxxxxx-xxxx.cloud.databricks.com"],
+    )
+    http_path: SecretStr = Field(
+        alias="httpPath",
+        description="the HTTP path of your Databricks SQL warehouse",
+        examples=["/sql/1.0/warehouses/xxxxxxxx"],
+    )
+    access_token: SecretStr = Field(
+        alias="accessToken",
+        description="the access token for your Databricks instance",
+        examples=["XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"],
+    )
+
+
+# https://docs.databricks.com/aws/en/dev-tools/python-sql-connector#oauth-machine-to-machine-m2m-authentication
+class DatabricksServicePrincipalConnectionInfo(BaseConnectionInfo):
+    databricks_type: Literal["service_principal"] = "service_principal"
+    server_hostname: SecretStr = Field(
+        alias="serverHostname",
+        description="the server hostname of your Databricks instance",
+        examples=["dbc-xxxxxxxx-xxxx.cloud.databricks.com"],
+    )
+    http_path: SecretStr = Field(
+        alias="httpPath",
+        description="the HTTP path of your Databricks SQL warehouse",
+        examples=["/sql/1.0/warehouses/xxxxxxxx"],
+    )
+    client_id: SecretStr = Field(
+        alias="clientId",
+        description="the client ID for OAuth M2M authentication",
+        examples=["your-client-id"],
+    )
+    client_secret: SecretStr = Field(
+        alias="clientSecret",
+        description="the client secret for OAuth M2M authentication",
+        examples=["your-client-secret"],
+    )
+    azure_tenant_id: SecretStr | None = Field(
+        alias="azureTenantId",
+        description="the Azure tenant ID for OAuth M2M authentication",
+        examples=["your-tenant-id"],
+        default=None,
+    )
+
+
+DatabricksConnectionUnion = Annotated[
+    Union[DatabricksTokenConnectionInfo, DatabricksServicePrincipalConnectionInfo],
+    Field(discriminator="databricks_type"),
+]
+
+
 class TrinoConnectionInfo(BaseConnectionInfo):
     host: SecretStr = Field(
         description="the hostname of your database", examples=["localhost"]
     )
-    port: SecretStr = Field(default="8080", description="the port of your database")
+    port: SecretPort = Field(default="8080", description="the port of your database")
     catalog: SecretStr = Field(
         description="the catalog name of your database", examples=["hive"]
     )
@@ -470,17 +674,21 @@ class GcsFileConnectionInfo(BaseConnectionInfo):
 
 ConnectionInfo = (
     AthenaConnectionInfo
-    | BigQueryConnectionInfo
+    | BigQueryDatasetConnectionInfo
+    | BigQueryProjectConnectionInfo
     | CannerConnectionInfo
     | ClickHouseConnectionInfo
     | ConnectionUrl
     | MSSqlConnectionInfo
     | MySqlConnectionInfo
+    | DorisConnectionInfo
     | OracleConnectionInfo
     | PostgresConnectionInfo
     | RedshiftConnectionInfo
     | RedshiftIAMConnectionInfo
     | SnowflakeConnectionInfo
+    | SparkConnectionInfo
+    | DatabricksTokenConnectionInfo
     | TrinoConnectionInfo
     | LocalFileConnectionInfo
     | S3FileConnectionInfo
@@ -492,7 +700,17 @@ ConnectionInfo = (
 class ValidateDTO(BaseModel):
     manifest_str: str = manifest_str_field
     parameters: dict
-    connection_info: dict[str, Any] | ConnectionInfo = connection_info_field
+    connection_info: dict[str, Any] | ConnectionInfo | None = connection_info_field
+    connection_file_path: str | None = Field(alias="connectionFilePath", default=None)
+
+    @model_validator(mode="after")
+    def check_connection_source(self):
+        if self.connection_info is None and self.connection_file_path is None:
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                "Either connectionInfo or connectionFilePath must be provided",
+            )
+        return self
 
 
 class AnalyzeSQLDTO(BaseModel):
@@ -512,8 +730,18 @@ class DryPlanDTO(BaseModel):
 
 class TranspileDTO(BaseModel):
     manifest_str: str = manifest_str_field
-    connection_info: dict[str, Any] | ConnectionInfo = connection_info_field
+    connection_info: dict[str, Any] | ConnectionInfo | None = connection_info_field
+    connection_file_path: str | None = Field(alias="connectionFilePath", default=None)
     sql: str
+
+    @model_validator(mode="after")
+    def check_connection_source(self):
+        if self.connection_info is None and self.connection_file_path is None:
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                "Either connectionInfo or connectionFilePath must be provided",
+            )
+        return self
 
 
 class ConfigModel(BaseModel):

@@ -8,17 +8,23 @@ from json import loads
 from typing import Any
 from urllib.parse import unquote_plus
 
+import boto3
 import ibis
+from google.cloud import bigquery
 from google.oauth2 import service_account
 from ibis import BaseBackend
 
 from app.model import (
     AthenaConnectionInfo,
-    BigQueryConnectionInfo,
+    BigQueryDatasetConnectionInfo,
+    BigQueryProjectConnectionInfo,
     CannerConnectionInfo,
     ClickHouseConnectionInfo,
     ConnectionInfo,
     ConnectionUrl,
+    DatabricksServicePrincipalConnectionInfo,
+    DatabricksTokenConnectionInfo,
+    DorisConnectionInfo,
     GcsFileConnectionInfo,
     LocalFileConnectionInfo,
     MinioFileConnectionInfo,
@@ -30,7 +36,10 @@ from app.model import (
     QueryBigQueryDTO,
     QueryCannerDTO,
     QueryClickHouseDTO,
+    QueryDatabricksDTO,
+    QueryDorisDTO,
     QueryDTO,
+    QueryDuckDBDTO,
     QueryGcsFileDTO,
     QueryLocalFileDTO,
     QueryMinioFileDTO,
@@ -41,11 +50,13 @@ from app.model import (
     QueryRedshiftDTO,
     QueryS3FileDTO,
     QuerySnowflakeDTO,
+    QuerySparkDTO,
     QueryTrinoDTO,
     RedshiftConnectionInfo,
     RedshiftIAMConnectionInfo,
     S3FileConnectionInfo,
     SnowflakeConnectionInfo,
+    SparkConnectionInfo,
     SSLMode,
     TrinoConnectionInfo,
 )
@@ -61,6 +72,7 @@ class DataSource(StrEnum):
     clickhouse = auto()
     mssql = auto()
     mysql = auto()
+    doris = auto()
     oracle = auto()
     postgres = auto()
     redshift = auto()
@@ -70,6 +82,9 @@ class DataSource(StrEnum):
     s3_file = auto()
     minio_file = auto()
     gcs_file = auto()
+    duckdb = auto()
+    spark = auto()
+    databricks = auto()
 
     def get_connection(self, info: ConnectionInfo) -> BaseBackend:
         try:
@@ -124,6 +139,10 @@ class DataSource(StrEnum):
                         f"{session_timeout}s"
                     )
                 info.kwargs["session_properties"] = session_properties
+            case DataSource.bigquery:
+                session_timeout = headers.get(X_WREN_DB_STATEMENT_TIMEOUT, 180)
+                if not hasattr(info, "job_timeout_ms") or info.job_timeout_ms is None:
+                    info.job_timeout_ms = int(session_timeout) * 1000
         return info
 
     def _build_connection_info(self, data: dict) -> ConnectionInfo:
@@ -142,7 +161,9 @@ class DataSource(StrEnum):
             case DataSource.athena:
                 return AthenaConnectionInfo.model_validate(data)
             case DataSource.bigquery:
-                return BigQueryConnectionInfo.model_validate(data)
+                if "bigquery_type" in data and data["bigquery_type"] == "project":
+                    return BigQueryProjectConnectionInfo.model_validate(data)
+                return BigQueryDatasetConnectionInfo.model_validate(data)
             case DataSource.canner:
                 return CannerConnectionInfo.model_validate(data)
             case DataSource.clickhouse:
@@ -151,6 +172,8 @@ class DataSource(StrEnum):
                 return MSSqlConnectionInfo.model_validate(data)
             case DataSource.mysql:
                 return MySqlConnectionInfo.model_validate(data)
+            case DataSource.doris:
+                return DorisConnectionInfo.model_validate(data)
             case DataSource.oracle:
                 return OracleConnectionInfo.model_validate(data)
             case DataSource.postgres:
@@ -163,6 +186,8 @@ class DataSource(StrEnum):
                 return SnowflakeConnectionInfo.model_validate(data)
             case DataSource.trino:
                 return TrinoConnectionInfo.model_validate(data)
+            case DataSource.duckdb:
+                return LocalFileConnectionInfo.model_validate(data)
             case DataSource.local_file:
                 return LocalFileConnectionInfo.model_validate(data)
             case DataSource.s3_file:
@@ -171,6 +196,15 @@ class DataSource(StrEnum):
                 return MinioFileConnectionInfo.model_validate(data)
             case DataSource.gcs_file:
                 return GcsFileConnectionInfo.model_validate(data)
+            case DataSource.spark:
+                return SparkConnectionInfo.model_validate(data)
+            case DataSource.databricks:
+                if (
+                    "databricks_type" in data
+                    and data["databricks_type"] == "service_principal"
+                ):
+                    return DatabricksServicePrincipalConnectionInfo.model_validate(data)
+                return DatabricksTokenConnectionInfo.model_validate(data)
             case _:
                 raise NotImplementedError(f"Unsupported data source: {self}")
 
@@ -211,15 +245,19 @@ class DataSourceExtension(Enum):
     clickhouse = QueryClickHouseDTO
     mssql = QueryMSSqlDTO
     mysql = QueryMySqlDTO
+    doris = QueryDorisDTO
     oracle = QueryOracleDTO
     postgres = QueryPostgresDTO
     redshift = QueryRedshiftDTO
     snowflake = QuerySnowflakeDTO
     trino = QueryTrinoDTO
     local_file = QueryLocalFileDTO
+    duckdb = QueryDuckDBDTO
     s3_file = QueryS3FileDTO
     minio_file = QueryMinioFileDTO
     gcs_file = QueryGcsFileDTO
+    databricks = QueryDatabricksDTO
+    spark = QuerySparkDTO
 
     def __init__(self, dto: QueryDTO):
         self.dto = dto
@@ -229,7 +267,7 @@ class DataSourceExtension(Enum):
             if hasattr(info, "connection_url"):
                 kwargs = info.kwargs if info.kwargs else {}
                 return ibis.connect(info.connection_url.get_secret_value(), **kwargs)
-            if self.name in {"local_file", "redshift"}:
+            if self.name in {"local_file", "redshift", "spark", "duckdb"}:
                 raise NotImplementedError(
                     f"{self.name} connection is not implemented to get ibis backend"
                 )
@@ -243,16 +281,58 @@ class DataSourceExtension(Enum):
 
     @staticmethod
     def get_athena_connection(info: AthenaConnectionInfo) -> BaseBackend:
-        return ibis.athena.connect(
-            s3_staging_dir=info.s3_staging_dir.get_secret_value(),
-            aws_access_key_id=info.aws_access_key_id.get_secret_value(),
-            aws_secret_access_key=info.aws_secret_access_key.get_secret_value(),
-            region_name=info.region_name.get_secret_value(),
-            schema_name=info.schema_name.get_secret_value(),
-        )
+        kwargs: dict[str, Any] = {
+            "s3_staging_dir": info.s3_staging_dir.get_secret_value(),
+            "schema_name": info.schema_name.get_secret_value(),
+        }
+
+        # ── Region ────────────────────────────────────────────────
+        if info.region_name:
+            kwargs["region_name"] = info.region_name.get_secret_value()
+
+        # ── Web Identity Token flow (Google OIDC → AWS STS) ───
+        if info.web_identity_token and info.role_arn:
+            oidc_token = info.web_identity_token.get_secret_value()
+            role_arn = info.role_arn.get_secret_value()
+            session_name = (
+                info.role_session_name.get_secret_value()
+                if info.role_session_name
+                else "wren-oidc-session"
+            )
+            region = info.region_name.get_secret_value() if info.region_name else None
+            sts = boto3.client("sts", region_name=region)
+
+            resp = sts.assume_role_with_web_identity(
+                RoleArn=role_arn,
+                RoleSessionName=session_name,
+                WebIdentityToken=oidc_token,
+            )
+
+            creds = resp["Credentials"]
+            kwargs["aws_access_key_id"] = creds["AccessKeyId"]
+            kwargs["aws_secret_access_key"] = creds["SecretAccessKey"]
+            kwargs["aws_session_token"] = creds["SessionToken"]
+
+        # ── Standard Access/Secret Keys ───────────────────────
+        elif info.aws_access_key_id and info.aws_secret_access_key:
+            kwargs["aws_access_key_id"] = info.aws_access_key_id.get_secret_value()
+            kwargs["aws_secret_access_key"] = (
+                info.aws_secret_access_key.get_secret_value()
+            )
+            if info.aws_session_token:
+                kwargs["aws_session_token"] = info.aws_session_token.get_secret_value()
+
+        # ── 3️⃣ Default AWS credential chain ───────────────────────
+        # Nothing needed — PyAthena automatically falls back to:
+        #   - Environment variables
+        #   - ~/.aws/credentials
+        #   - IAM Role (EC2, ECS, Lambda)
+
+        # Now connect via Ibis wrapper
+        return ibis.athena.connect(**kwargs)
 
     @staticmethod
-    def get_bigquery_connection(info: BigQueryConnectionInfo) -> BaseBackend:
+    def get_bigquery_connection(info: BigQueryDatasetConnectionInfo) -> BaseBackend:
         credits_json = loads(
             base64.b64decode(info.credentials.get_secret_value()).decode("utf-8")
         )
@@ -265,11 +345,14 @@ class DataSourceExtension(Enum):
                 "https://www.googleapis.com/auth/cloud-platform",
             ]
         )
-        return ibis.bigquery.connect(
-            project_id=info.project_id.get_secret_value(),
-            dataset_id=info.dataset_id.get_secret_value(),
-            credentials=credentials,
+        bq_client = bigquery.Client(
+            project=info.project_id.get_secret_value(), credentials=credentials
         )
+        job_config = bigquery.QueryJobConfig()
+        job_config.job_timeout_ms = info.job_timeout_ms
+        bq_client.default_query_job_config = job_config
+        backend = ibis.bigquery.connect(client=bq_client, credentials=credentials)
+        return backend
 
     @staticmethod
     def get_canner_connection(info: CannerConnectionInfo) -> BaseBackend:
@@ -324,6 +407,42 @@ class DataSourceExtension(Enum):
             password=info.password.get_secret_value() if info.password else "",
             **kwargs,
         )
+
+    @classmethod
+    def get_doris_connection(cls, info: DorisConnectionInfo) -> BaseBackend:
+        kwargs = {}
+
+        # utf8mb4 is the actual charset used by Doris (MySQL-compatible)
+        kwargs.setdefault("charset", "utf8mb4")
+
+        if info.kwargs:
+            kwargs.update(info.kwargs)
+        # Doris is MySQL-protocol compatible, reuse ibis.mysql.connect()
+        connection = ibis.mysql.connect(
+            host=info.host.get_secret_value(),
+            port=int(info.port.get_secret_value()),
+            database=info.database.get_secret_value(),
+            user=info.user.get_secret_value(),
+            password=info.password.get_secret_value() if info.password else "",
+            **kwargs,
+        )
+        # Doris does not properly reflect the SERVER_STATUS_AUTOCOMMIT flag
+        # in its MySQL-protocol handshake/OK packets. As a result, the
+        # underlying mysqlclient driver's get_autocommit() always returns
+        # False — even after explicitly calling autocommit(True).
+        #
+        # ibis's raw_sql() checks get_autocommit() and, when it returns
+        # False, wraps every query in BEGIN/ROLLBACK. Doris (an OLAP engine)
+        # does not support transactional SELECT inside BEGIN and will reject
+        # with: "This is in a transaction, only insert, update, delete,
+        # commit, rollback is acceptable."
+        #
+        # Fix: override get_autocommit on THIS connection instance only so
+        # that ibis skips the BEGIN/ROLLBACK wrapping. This is a per-object
+        # attribute override — it does NOT affect the MySQLdb class, other
+        # MySQL connections, or any other data-source driver.
+        connection.con.get_autocommit = lambda: True
+        return connection
 
     @staticmethod
     def get_postgres_connection(info: PostgresConnectionInfo) -> BaseBackend:
@@ -398,6 +517,14 @@ class DataSourceExtension(Enum):
             user=(info.user and info.user.get_secret_value()),
             password=(info.password and info.password.get_secret_value()),
             **info.kwargs if info.kwargs else dict(),
+        )
+
+    @staticmethod
+    def get_databricks_connection(info: DatabricksTokenConnectionInfo) -> BaseBackend:
+        return ibis.databricks.connect(
+            server_hostname=info.server_hostname.get_secret_value(),
+            http_path=info.http_path.get_secret_value(),
+            access_token=info.access_token.get_secret_value(),
         )
 
     @staticmethod

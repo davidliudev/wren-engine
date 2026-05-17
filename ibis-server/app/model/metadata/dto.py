@@ -1,13 +1,52 @@
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from app.model import ConnectionInfo
+from app.model.data_source import DataSource
+from app.model.error import ErrorCode, WrenError
+
+
+class V2MetadataDTO(BaseModel):
+    connection_info: dict[str, Any] | ConnectionInfo = Field(alias="connectionInfo")
+
+
+class FilterInfo(BaseModel):
+    pass
 
 
 class MetadataDTO(BaseModel):
-    connection_info: dict[str, Any] | ConnectionInfo = Field(alias="connectionInfo")
+    connection_info: dict[str, Any] | ConnectionInfo | None = Field(
+        alias="connectionInfo", default=None
+    )
+    connection_file_path: str | None = Field(alias="connectionFilePath", default=None)
+    table_limit: int | None = Field(alias="limit", default=None)
+    filter_info: dict[str, Any] | None = Field(alias="filterInfo", default=None)
+
+    @model_validator(mode="after")
+    def check_connection_source(self):
+        if self.connection_info is None and self.connection_file_path is None:
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                "Either connectionInfo or connectionFilePath must be provided",
+            )
+        return self
+
+
+class BigQueryFilterInfo(FilterInfo):
+    projects: list["ProjectDatasets"] | None = None
+
+
+class ProjectDatasets(BaseModel):
+    project_id: str = Field(alias="projectId")
+    dataset_ids: list[str] | None = Field(alias="datasetIds", default=None)
+
+
+def get_filter_info(data_source: DataSource, info: dict[str, Any]) -> FilterInfo | None:
+    if data_source == DataSource.bigquery:
+        return BigQueryFilterInfo(**info)
+    return None
 
 
 class RustWrenEngineColumnType(Enum):
@@ -50,6 +89,7 @@ class RustWrenEngineColumnType(Enum):
     INT64 = "INT64"
     TIME = "TIME"
     NULL = "NULL"
+    VARIANT = "VARIANT"
 
     # Extension types
     ## PostGIS
@@ -82,6 +122,11 @@ class Table(BaseModel):
     description: str | None = None
     properties: TableProperties = None
     primaryKey: str | None = None
+
+
+class Catalog(BaseModel):
+    name: str
+    schemas: list[str]
 
 
 class ConstraintType(Enum):

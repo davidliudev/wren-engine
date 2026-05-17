@@ -15,8 +15,12 @@ target/
 .mvn/timing.properties
 .mvn/maven.config
 wren-server/etc
+mcp-server/workspace/*
+!mcp-server/workspace/.gitkeep
 /**/var/
 __pycache__/
 venv/
 **/.env*
 **/*.so
+wren-core-py/dist/
+.claude/worktrees/

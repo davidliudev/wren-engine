@@ -1,5 +1,6 @@
 use crate::errors::CoreError;
 use crate::manifest::to_manifest;
+use datafusion_common::config::Dialect;
 use pyo3::{pyclass, pymethods};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -43,9 +44,11 @@ impl PyManifestExtractor {
 }
 
 fn resolve_used_table_names(mdl: &WrenMDL, sql: &str) -> Result<Vec<String>, CoreError> {
-    let ctx_state = wren_core::SessionContext::new().state();
+    let mut config = wren_core::SessionConfig::new();
+    config.options_mut().sql_parser.enable_ident_normalization = false;
+    let ctx_state = wren_core::SessionContext::new_with_config(config).state();
     ctx_state
-        .sql_to_statement(sql, "generic")
+        .sql_to_statement(sql, &Dialect::Generic {})
         .map_err(CoreError::from)
         .and_then(|stmt| {
             ctx_state
@@ -78,13 +81,14 @@ fn extract_manifest(
         .collect::<Vec<_>>();
     let used_relationships = extract_relationships(mdl, &used_models);
     Ok(Manifest {
+        layout_version: mdl.manifest.layout_version,
         catalog: mdl.catalog().to_string(),
         schema: mdl.schema().to_string(),
         models: used_models,
         relationships: used_relationships,
-        metrics: mdl.metrics().to_vec(),
         views: used_views,
         data_source: mdl.data_source(),
+        cubes: mdl.manifest.cubes.clone(),
     })
 }
 

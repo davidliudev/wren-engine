@@ -3,6 +3,8 @@ from app.model.metadata.athena import AthenaMetadata
 from app.model.metadata.bigquery import BigQueryMetadata
 from app.model.metadata.canner import CannerMetadata
 from app.model.metadata.clickhouse import ClickHouseMetadata
+from app.model.metadata.databricks import DatabricksMetadata
+from app.model.metadata.doris import DorisMetadata
 from app.model.metadata.metadata import Metadata
 from app.model.metadata.mssql import MSSQLMetadata
 from app.model.metadata.mysql import MySQLMetadata
@@ -17,6 +19,7 @@ from app.model.metadata.oracle import OracleMetadata
 from app.model.metadata.postgres import PostgresMetadata
 from app.model.metadata.redshift import RedshiftMetadata
 from app.model.metadata.snowflake import SnowflakeMetadata
+from app.model.metadata.spark import SparkMetadata
 from app.model.metadata.trino import TrinoMetadata
 
 mapping = {
@@ -26,6 +29,7 @@ mapping = {
     DataSource.clickhouse: ClickHouseMetadata,
     DataSource.mssql: MSSQLMetadata,
     DataSource.mysql: MySQLMetadata,
+    DataSource.doris: DorisMetadata,
     DataSource.oracle: OracleMetadata,
     DataSource.postgres: PostgresMetadata,
     DataSource.redshift: RedshiftMetadata,
@@ -35,6 +39,9 @@ mapping = {
     DataSource.s3_file: S3FileMetadata,
     DataSource.minio_file: MinioFileMetadata,
     DataSource.gcs_file: GcsFileMetadata,
+    DataSource.databricks: DatabricksMetadata,
+    DataSource.spark: SparkMetadata,
+    DataSource.duckdb: DuckDBMetadata,
 }
 
 

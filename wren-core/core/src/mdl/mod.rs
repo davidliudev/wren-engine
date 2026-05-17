@@ -2,22 +2,24 @@ use crate::logical_plan::analyze::access_control::validate_clac_rule;
 use crate::logical_plan::error::WrenError;
 use crate::logical_plan::utils::{from_qualified_name_str, try_map_data_type};
 use crate::mdl::builder::ManifestBuilder;
-use crate::mdl::context::{create_ctx_with_mdl, Mode, WrenDataSource};
+use crate::mdl::context::{apply_wren_on_ctx, Mode, WrenDataSource};
+use crate::mdl::dialect::inner_dialect::get_inner_dialect;
 use crate::mdl::function::{
     ByPassAggregateUDF, ByPassScalarUDF, ByPassWindowFunction, FunctionType,
     RemoteFunction,
 };
-use crate::mdl::manifest::{Column, Manifest, Metric, Model, View};
-use crate::mdl::utils::to_field;
+use crate::mdl::manifest::{Column, Manifest, Model, View};
+use crate::mdl::utils::{dequote_identifier, quoted, to_field};
 use crate::DataFusionError;
 use context::SessionPropertiesRef;
 use datafusion::arrow::datatypes::Field;
-use datafusion::common::internal_datafusion_err;
+use datafusion::common::{internal_datafusion_err, plan_err};
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionState;
+use datafusion::execution::{SessionStateBuilder, SessionStateDefaults};
 use datafusion::logical_expr::{AggregateUDF, ScalarUDF, WindowUDF};
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion::sql::parser::DFParser;
 use datafusion::sql::sqlparser::ast::{Expr, ExprWithAlias, Ident};
 use datafusion::sql::sqlparser::dialect::dialect_from_str;
@@ -25,7 +27,7 @@ use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
 pub use dataset::Dataset;
 use dialect::WrenDialect;
-use log::{debug, info};
+use log::{debug, info, warn};
 use manifest::Relationship;
 use parking_lot::RwLock;
 use std::hash::Hash;
@@ -43,6 +45,7 @@ pub mod lineage;
 pub mod manifest {
     pub use wren_core_base::mdl::manifest::*;
 }
+pub mod type_planner;
 pub mod utils;
 
 pub type SessionStateRef = Arc<RwLock<SessionState>>;
@@ -98,6 +101,71 @@ impl AnalyzedWrenMDL {
         })
     }
 
+    /// Analyze MDL with URL-based table references.
+    ///
+    /// Instead of using `DynamicListTableFactory` (which requires WebDAV PROPFIND),
+    /// directly creates `ListingTable` for each model by:
+    /// 1. Parsing the tableReference as a URL
+    /// 2. Setting format to Parquet (known from file extension)
+    /// 3. Only calling `infer_schema` (uses GET + Range to read Parquet footer)
+    ///
+    /// This follows the DuckDB-WASM pattern: known URL + known format = no listing needed.
+    pub async fn analyze_with_url_tables(
+        manifest: Manifest,
+        ctx: &SessionContext,
+    ) -> Result<Self> {
+        use datafusion::datasource::file_format::parquet::ParquetFormat;
+        use datafusion::datasource::listing::{
+            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+        };
+
+        let mut wren_mdl = WrenMDL::new(manifest);
+        // Allow manifests that omit `dataSource` (treat as file-backed). Only
+        // reject when `dataSource` is explicitly set to a non-file backend.
+        if let Some(data_source) = wren_mdl.data_source() {
+            match data_source {
+                DataSource::LocalFile
+                | DataSource::MinioFile
+                | DataSource::S3File
+                | DataSource::GcsFile => {}
+                _ => {
+                    return plan_err!(
+                        "Only file-based data source is supported for analyze_with_url_tables"
+                    )
+                }
+            }
+        }
+
+        let state = ctx.state();
+        for model in wren_mdl.models().to_vec() {
+            let Some(table_reference) = model.table_reference() else {
+                warn!("Model '{}' does not have a table reference, skipping URL-based analysis", model.name());
+                continue;
+            };
+            let url_str = dequote_identifier(table_reference);
+            let table_url = ListingTableUrl::parse(url_str)?;
+
+            // Skip infer_options (which does PROPFIND/list).
+            // We know the format is Parquet from the tableReference extension.
+            let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+                .with_file_extension(".parquet");
+
+            let config = ListingTableConfig::new(table_url)
+                .with_listing_options(options)
+                .infer_schema(&state)
+                .await?;
+
+            let table = ListingTable::try_new(config)?;
+            wren_mdl.register_table(table_reference.to_string(), Arc::new(table));
+        }
+
+        let lineage = lineage::Lineage::new(&wren_mdl)?;
+        Ok(AnalyzedWrenMDL {
+            wren_mdl: Arc::new(wren_mdl),
+            lineage: Arc::new(lineage),
+        })
+    }
+
     pub fn wren_mdl(&self) -> Arc<WrenMDL> {
         Arc::clone(&self.wren_mdl)
     }
@@ -141,37 +209,6 @@ impl WrenMDL {
                 );
             });
         });
-        manifest.metrics.iter().for_each(|metric| {
-            metric.dimension.iter().for_each(|dimension| {
-                qualifed_references.insert(
-                    from_qualified_name_str(
-                        &manifest.catalog,
-                        &manifest.schema,
-                        metric.name(),
-                        dimension.name(),
-                    ),
-                    ColumnReference::new(
-                        Dataset::Metric(Arc::clone(metric)),
-                        Arc::clone(dimension),
-                    ),
-                );
-            });
-            metric.measure.iter().for_each(|measure| {
-                qualifed_references.insert(
-                    from_qualified_name_str(
-                        &manifest.catalog,
-                        &manifest.schema,
-                        metric.name(),
-                        measure.name(),
-                    ),
-                    ColumnReference::new(
-                        Dataset::Metric(Arc::clone(metric)),
-                        Arc::clone(measure),
-                    ),
-                );
-            });
-        });
-
         WrenMDL {
             catalog_schema_prefix: format!("{}.{}.", &manifest.catalog, &manifest.schema),
             manifest,
@@ -191,45 +228,67 @@ impl WrenMDL {
         properties: SessionPropertiesRef,
         mode: Mode,
     ) -> Result<Self> {
+        use wren_core_base::mdl::ModelSource;
+
         let mut mdl = WrenMDL::new(manifest);
-        let sources: Vec<_> = mdl
-            .models()
-            .iter()
-            .map(|model| {
-                let name = TableReference::from(model.table_reference());
-                let available_columns = model
-                    .columns
-                    .iter()
-                    .map(|column| {
-                        if mode.is_permission_analyze()
-                            || validate_clac_rule(
-                                model.name(),
-                                column,
-                                &properties,
-                                None,
-                            )?
-                            .0
-                        {
-                            Ok(Some(Arc::clone(column)))
-                        } else {
-                            Ok(None)
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let fields: Vec<_> = available_columns
-                    .into_iter()
-                    .filter(|c| c.is_some())
-                    .filter_map(|column| {
-                        Self::infer_source_column(&column.unwrap()).ok().flatten()
-                    })
-                    .collect();
-                let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
-                let datasource = WrenDataSource::new_with_schema(schema);
-                Ok((name.to_quoted_string(), Arc::new(datasource)))
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let sources: Vec<_> =
+            mdl.models()
+                .iter()
+                .map(|model| match model.source() {
+                    ModelSource::TableReference => {
+                        let name = TableReference::from(model.table_reference().expect(
+                            "table_reference must exist for TableReference source",
+                        ));
+                        let available_columns = model
+                            .columns
+                            .iter()
+                            .map(|column| {
+                                if mode.is_permission_analyze()
+                                    || validate_clac_rule(
+                                        model.name(),
+                                        column,
+                                        &properties,
+                                        None,
+                                    )?
+                                    .0
+                                {
+                                    Ok(Some(Arc::clone(column)))
+                                } else {
+                                    Ok(None)
+                                }
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        let fields: Vec<_> = available_columns
+                            .into_iter()
+                            .filter(|c| c.is_some())
+                            .filter_map(|column| {
+                                Self::infer_source_column(&column.unwrap()).ok().flatten()
+                            })
+                            .collect();
+                        let schema =
+                            Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+                        let datasource = WrenDataSource::new_with_schema(schema);
+                        Ok(Some((name.to_quoted_string(), Arc::new(datasource))))
+                    }
+                    ModelSource::RefSql => {
+                        let fields: Vec<_> = model
+                            .get_physical_columns(false)
+                            .iter()
+                            .filter_map(|column| to_field(column).ok())
+                            .collect();
+                        let schema =
+                            Arc::new(datafusion::arrow::datatypes::Schema::new(fields));
+                        let datasource = WrenDataSource::new_with_schema(schema);
+                        Ok(Some((quoted(model.name()), Arc::new(datasource))))
+                    }
+                    ModelSource::Invalid(reason) => {
+                        Err(datafusion::error::DataFusionError::Plan(reason))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
         sources
             .into_iter()
+            .flatten()
             .for_each(|(name, ds_ref)| mdl.register_table(name, ds_ref));
         Ok(mdl)
     }
@@ -317,10 +376,6 @@ impl WrenMDL {
         &self.manifest.relationships
     }
 
-    pub fn metrics(&self) -> &[Arc<Metric>] {
-        &self.manifest.metrics
-    }
-
     pub fn data_source(&self) -> Option<DataSource> {
         self.manifest.data_source
     }
@@ -361,7 +416,47 @@ impl WrenMDL {
     }
 }
 
-/// Transform the SQL based on the MDL
+/// Create a SessionContext with the default functions registered
+pub fn create_wren_ctx(
+    config: Option<SessionConfig>,
+    data_source: Option<&DataSource>,
+) -> SessionContext {
+    let builder = SessionStateBuilder::new()
+        .with_expr_planners(SessionStateDefaults::default_expr_planners())
+        .with_table_function_list(crate::mdl::function::table_functions());
+
+    let builder = if let Some(data_source) = data_source {
+        let dialect = get_inner_dialect(data_source);
+        builder
+            .with_scalar_functions(dialect.supported_udfs())
+            .with_aggregate_functions(dialect.supported_udafs())
+            .with_window_functions(dialect.supported_udwfs())
+    } else {
+        builder
+            .with_scalar_functions(crate::mdl::function::scalar_functions())
+            .with_aggregate_functions(crate::mdl::function::aggregate_functions())
+            .with_window_functions(crate::mdl::function::window_functions())
+    };
+
+    let mut config = config.unwrap_or_default();
+
+    if config.options().execution.time_zone.is_none() {
+        // Set default time zone to UTC to avoid time zone related issues in timestamp inference and comparison. It can be overridden by the user config.
+        config
+            .options_mut()
+            .set("datafusion.execution.time_zone", "+00:00")
+            .unwrap();
+    }
+
+    let builder = builder.with_config(config);
+
+    SessionContext::new_with_state(builder.build())
+}
+
+/// Transform the SQL based on the MDL (sync wrapper, requires multi-thread tokio runtime).
+///
+/// Not available on WASM — use [`transform_sql_with_ctx`] directly in async context.
+#[cfg(feature = "multi-thread")]
 pub fn transform_sql(
     analyzed_mdl: Arc<AnalyzedWrenMDL>,
     remote_functions: &[RemoteFunction],
@@ -370,7 +465,7 @@ pub fn transform_sql(
 ) -> Result<String> {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(transform_sql_with_ctx(
-        &SessionContext::new(),
+        &create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref()),
         analyzed_mdl,
         remote_functions,
         Arc::new(properties),
@@ -392,7 +487,7 @@ pub async fn transform_sql_with_ctx(
         register_remote_function(ctx, remote_function)?;
         Ok::<_, DataFusionError>(())
     })?;
-    let ctx = create_ctx_with_mdl(
+    let ctx = apply_wren_on_ctx(
         ctx,
         Arc::clone(&analyzed_mdl),
         Arc::clone(&properties),
@@ -426,7 +521,11 @@ pub async fn transform_sql_with_ctx(
 
     let data_source = analyzed_mdl.wren_mdl().data_source().unwrap_or_default();
     let wren_dialect = WrenDialect::new(&data_source);
-    let unparser = Unparser::new(&wren_dialect).with_pretty(true);
+    let unparser = Unparser::new(&wren_dialect)
+        .with_pretty(true)
+        .with_extension_unparsers(vec![Arc::new(
+            crate::logical_plan::unparser::SqlReferenceNodeUnparser,
+        )]);
     // show the planned sql
     match unparser.plan_to_sql(&analyzed) {
         Ok(sql) => {
@@ -452,20 +551,19 @@ async fn permission_analyze(
     remote_functions: &[RemoteFunction],
     properties: SessionPropertiesRef,
 ) -> Result<()> {
+    let ctx = create_wren_ctx(None, manifest.data_source.as_ref());
     let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
         manifest,
         Arc::clone(&properties),
         Mode::PermissionAnalyze,
     )?);
-    let ctx = SessionContext::new();
     remote_functions.iter().try_for_each(|remote_function| {
         debug!("Registering remote function: {remote_function:?}");
         register_remote_function(&ctx, remote_function)?;
         Ok::<_, DataFusionError>(())
     })?;
-    let ctx =
-        create_ctx_with_mdl(&ctx, analyzed_mdl, properties, Mode::PermissionAnalyze)
-            .await?;
+    let ctx = apply_wren_on_ctx(&ctx, analyzed_mdl, properties, Mode::PermissionAnalyze)
+        .await?;
 
     let plan = match ctx.state().create_logical_plan(sql).await {
         Ok(plan) => plan,
@@ -497,25 +595,32 @@ fn register_remote_function(
     ctx: &SessionContext,
     remote_function: &RemoteFunction,
 ) -> Result<()> {
+    // DataFusion normalizes function names to lowercase during SQL parsing,
+    // but we need to register with the original name for SQL generation
+    // and add the lowercase name as an alias for parsing.
+    let normalized_name = remote_function.name.to_lowercase();
+    let original_name = &remote_function.name;
+
     match &remote_function.function_type {
-        FunctionType::Scalar => {
-            ctx.register_udf(ScalarUDF::new_from_impl(ByPassScalarUDF::new(
-                &remote_function.name,
+        FunctionType::Scalar => ctx.register_udf(ScalarUDF::new_from_impl(
+            ByPassScalarUDF::new_with_original_name(
+                original_name,
+                &normalized_name,
                 try_map_data_type(&remote_function.return_type)?,
-            )))
-        }
-        FunctionType::Aggregate => {
-            ctx.register_udaf(AggregateUDF::new_from_impl(ByPassAggregateUDF::new(
-                &remote_function.name,
+            ),
+        )),
+        FunctionType::Aggregate => ctx.register_udaf(AggregateUDF::new_from_impl(
+            ByPassAggregateUDF::new_with_return_type(
+                &normalized_name,
                 try_map_data_type(&remote_function.return_type)?,
-            )))
-        }
-        FunctionType::Window => {
-            ctx.register_udwf(WindowUDF::new_from_impl(ByPassWindowFunction::new(
-                &remote_function.name,
+            ),
+        )),
+        FunctionType::Window => ctx.register_udwf(WindowUDF::new_from_impl(
+            ByPassWindowFunction::new_with_return_type(
+                &normalized_name,
                 try_map_data_type(&remote_function.return_type)?,
-            )))
-        }
+            ),
+        )),
     };
     Ok(())
 }
@@ -549,11 +654,11 @@ mod test {
     use std::sync::Arc;
 
     use crate::mdl::builder::{ColumnBuilder, ManifestBuilder, ModelBuilder};
-    use crate::mdl::context::{create_ctx_with_mdl, Mode};
+    use crate::mdl::context::{apply_wren_on_ctx, Mode, SessionPropertiesRef};
     use crate::mdl::function::RemoteFunction;
     use crate::mdl::manifest::DataSource::MySQL;
     use crate::mdl::manifest::Manifest;
-    use crate::mdl::{self, transform_sql_with_ctx, AnalyzedWrenMDL};
+    use crate::mdl::{self, create_wren_ctx, transform_sql_with_ctx, AnalyzedWrenMDL};
     use datafusion::arrow::array::{
         ArrayRef, Int64Array, RecordBatch, StringArray, TimestampNanosecondArray,
     };
@@ -561,13 +666,13 @@ mod test {
     use datafusion::common::format::DEFAULT_FORMAT_OPTIONS;
     use datafusion::common::not_impl_err;
     use datafusion::common::Result;
-    use datafusion::prelude::SessionContext;
     use datafusion::sql::unparser::plan_to_sql;
     use insta::assert_snapshot;
     use wren_core_base::mdl::{
         ColumnLevelOperator, DataSource, JoinType, RelationshipBuilder, SessionProperty,
     };
 
+    #[cfg(feature = "multi-thread")]
     #[test]
     fn test_sync_transform() -> Result<()> {
         let test_data: PathBuf =
@@ -626,7 +731,7 @@ mod test {
         for sql in tests {
             println!("Original: {sql}");
             let actual = mdl::transform_sql_with_ctx(
-                &SessionContext::new(),
+                &create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref()),
                 Arc::clone(&analyzed_mdl),
                 &[],
                 Arc::new(HashMap::new()),
@@ -659,7 +764,7 @@ mod test {
         let sql = "select * from test.test.customer_view";
         println!("Original: {sql}");
         let _ = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref()),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -691,7 +796,7 @@ mod test {
         )?);
         let sql = "select totalcost from profile";
         let result = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref()),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -702,7 +807,7 @@ mod test {
 
         let sql = "select totalcost from profile where p_sex = 'M'";
         let result = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref()),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -716,8 +821,6 @@ mod test {
 
     #[tokio::test]
     async fn test_uppercase_catalog_schema() -> Result<()> {
-        let ctx = SessionContext::new();
-        ctx.register_batch("customer", customer())?;
         let manifest = ManifestBuilder::new()
             .catalog("CTest")
             .schema("STest")
@@ -736,7 +839,7 @@ mod test {
         )?);
         let sql = r#"select * from CTest.STest.Customer"#;
         let actual = mdl::transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref()),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -757,7 +860,6 @@ mod test {
             [env!("CARGO_MANIFEST_DIR"), "tests", "data", "functions.csv"]
                 .iter()
                 .collect();
-        let ctx = SessionContext::new();
         let functions = csv::Reader::from_path(test_data)
             .unwrap()
             .into_deserialize::<RemoteFunction>()
@@ -779,6 +881,7 @@ mod test {
             Arc::new(HashMap::default()),
             Mode::Unparse,
         )?);
+        let ctx = create_wren_ctx(None, analyzed_mdl.wren_mdl().data_source().as_ref());
         let actual = transform_sql_with_ctx(
             &ctx,
             Arc::clone(&analyzed_mdl),
@@ -816,7 +919,7 @@ mod test {
 
     #[tokio::test]
     async fn test_unicode_remote_column_name() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         ctx.register_batch("artist", artist())?;
         let manifest = ManifestBuilder::new()
             .catalog("wren")
@@ -855,7 +958,7 @@ mod test {
         )?);
         let sql = r#"select * from wren.test.artist"#;
         let actual = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -863,15 +966,13 @@ mod test {
         )
         .await?;
         assert_snapshot!(actual,
-                           @"SELECT artist.\"名字\", artist.name_append, artist.\"group\", artist.subscribe, artist.subscribe_plus FROM \
-                           (SELECT artist.\"group\", artist.name_append, artist.subscribe, artist.subscribe_plus, artist.\"名字\" FROM \
-                           (SELECT __source.\"名字\" AS \"名字\", __source.\"名字\" || __source.\"名字\" AS name_append, __source.\"組別\" AS \"group\", CAST(__source.\"訂閱數\" AS BIGINT) + 1 AS subscribe_plus, __source.\"訂閱數\" AS subscribe FROM artist AS __source) AS artist) AS artist"
+                           @r#"SELECT artist."名字", artist.name_append, artist."group", artist.subscribe, artist.subscribe_plus FROM (SELECT artist."group", artist.name_append, artist.subscribe, artist.subscribe_plus, artist."名字" FROM (SELECT __source."名字" AS "名字", __source."名字" || __source."名字" AS name_append, __source."組別" AS "group", __source."訂閱數" + 1 AS subscribe_plus, __source."訂閱數" AS subscribe FROM artist AS __source) AS artist) AS artist"#
         );
         ctx.sql(&actual).await?.show().await?;
 
         let sql = r#"select group from wren.test.artist"#;
         let actual = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -884,7 +985,7 @@ mod test {
 
         let sql = r#"select subscribe_plus from wren.test.artist"#;
         let actual = mdl::transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -892,13 +993,13 @@ mod test {
         )
         .await?;
         assert_snapshot!(actual,
-                   @"SELECT artist.subscribe_plus FROM (SELECT artist.subscribe_plus FROM (SELECT CAST(__source.\"訂閱數\" AS BIGINT) + 1 AS subscribe_plus FROM artist AS __source) AS artist) AS artist");
+                   @r#"SELECT artist.subscribe_plus FROM (SELECT artist.subscribe_plus FROM (SELECT __source."訂閱數" + 1 AS subscribe_plus FROM artist AS __source) AS artist) AS artist"#);
         ctx.sql(&actual).await?.show().await
     }
 
     #[tokio::test]
     async fn test_invalid_infer_remote_table() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         ctx.register_batch("artist", artist())?;
         let manifest = ManifestBuilder::new()
             .catalog("wren")
@@ -927,7 +1028,7 @@ mod test {
         )?);
         let sql = r#"select name_append from wren.test.artist"#;
         let _ = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -943,7 +1044,7 @@ mod test {
 
         let sql = r#"select lower_name from wren.test.artist"#;
         let _ = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -961,7 +1062,7 @@ mod test {
 
     #[tokio::test]
     async fn test_query_hidden_column() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         ctx.register_batch("artist", artist())?;
         let manifest = ManifestBuilder::new()
             .catalog("wren")
@@ -986,7 +1087,7 @@ mod test {
         )?);
         let sql = r#"select 串接名字 from wren.test.artist"#;
         let actual = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -997,7 +1098,7 @@ mod test {
                    @"SELECT artist.\"串接名字\" FROM (SELECT artist.\"串接名字\" FROM (SELECT __source.\"名字\" || __source.\"名字\" AS \"串接名字\" FROM artist AS __source) AS artist) AS artist");
         let sql = r#"select * from wren.test.artist"#;
         let actual = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -1009,7 +1110,7 @@ mod test {
 
         let sql = r#"select "名字" from wren.test.artist"#;
         let _ = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -1028,7 +1129,7 @@ mod test {
     async fn test_disable_simplify_expression() -> Result<()> {
         let sql = "select current_date";
         let actual = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::new(AnalyzedWrenMDL::default()),
             &[],
             Arc::new(HashMap::new()),
@@ -1059,7 +1160,7 @@ mod test {
         )?);
         let sql = r#"select * from wren.test.artist where 名字 in (SELECT 名字 FROM wren.test.artist)"#;
         let actual = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -1074,7 +1175,7 @@ mod test {
     /// This test will be failed if the `出道時間` is not inferred as a timestamp column correctly.
     #[tokio::test]
     async fn test_infer_timestamp_column() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         ctx.register_batch("artist", artist())?;
         let manifest = ManifestBuilder::new()
             .catalog("wren")
@@ -1094,7 +1195,7 @@ mod test {
         )?);
         let sql = r#"select current_date > "出道時間" from wren.test.artist"#;
         let actual = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -1109,7 +1210,7 @@ mod test {
 
     #[tokio::test]
     async fn test_disable_count_wildcard_rule() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         let analyzed_mdl = Arc::new(AnalyzedWrenMDL::default());
         let sql = "select count(*) from (select 1)";
@@ -1128,7 +1229,7 @@ mod test {
     }
 
     async fn assert_sql_valid_executable(sql: &str) -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         // To roundtrip testing, we should register the mock table for the planned sql.
         ctx.register_batch("orders", orders())?;
         ctx.register_batch("customer", customer())?;
@@ -1150,7 +1251,7 @@ mod test {
 
     #[tokio::test]
     async fn test_mysql_style_interval() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, Some(&DataSource::MySQL));
         let analyzed_mdl = Arc::new(AnalyzedWrenMDL::default());
         let sql = "select interval 1 day";
         let actual = transform_sql_with_ctx(
@@ -1192,7 +1293,7 @@ mod test {
 
     #[tokio::test]
     async fn test_unnest_as_table_factor() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new().build();
         let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
             manifest,
@@ -1233,7 +1334,7 @@ mod test {
 
     #[tokio::test]
     async fn test_simplify_timestamp() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let analyzed_mdl = Arc::new(AnalyzedWrenMDL::default());
         let sql = "select timestamp '2011-01-01 18:00:00 +08:00'";
         let actual = transform_sql_with_ctx(
@@ -1264,7 +1365,7 @@ mod test {
         let mut headers = HashMap::new();
         headers.insert("x-wren-timezone".to_string(), Some("+08:00".to_string()));
         let headers_ref = Arc::new(headers);
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let analyzed_mdl = Arc::new(AnalyzedWrenMDL::default());
         let sql = "select timestamp '2011-01-01 18:00:00'";
         let actual = transform_sql_with_ctx(
@@ -1290,7 +1391,7 @@ mod test {
         // TIMESTAMP WITH TIME ZONE will be converted to the session timezone
         assert_snapshot!(actual, @"SELECT CAST('2011-01-01 10:00:00' AS TIMESTAMP) AS \"Utf8(\"\"2011-01-01 18:00:00\"\")\"");
 
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let mut headers = HashMap::new();
         headers.insert(
             "x-wren-timezone".to_string(),
@@ -1324,7 +1425,7 @@ mod test {
 
         let headers = HashMap::new();
         let headers_ref = Arc::new(headers);
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let analyzed_mdl = Arc::new(AnalyzedWrenMDL::default());
         let sql = "select timestamp with time zone '2011-01-01 18:00:00' - timestamp with time zone '2011-01-01 10:00:00'";
         let actual = transform_sql_with_ctx(
@@ -1343,8 +1444,6 @@ mod test {
 
     #[tokio::test]
     async fn test_disable_pushdown_filter() -> Result<()> {
-        let ctx = SessionContext::new();
-        ctx.register_batch("artist", artist())?;
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -1372,7 +1471,7 @@ mod test {
         )?);
         let sql = r#"select count(*) from wren.test.artist where cast(cast_timestamptz as timestamp) > timestamp '2011-01-01 21:00:00'"#;
         let actual = transform_sql_with_ctx(
-            &SessionContext::new(),
+            &create_wren_ctx(None, None),
             Arc::clone(&analyzed_mdl),
             &[],
             Arc::new(HashMap::new()),
@@ -1390,7 +1489,7 @@ mod test {
 
     #[tokio::test]
     async fn test_register_timestamptz() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         ctx.register_batch("timestamp_table", timestamp_table())?;
         let provider = ctx
             .catalog("datafusion")
@@ -1420,7 +1519,7 @@ mod test {
         let analyzed_mdl =
             Arc::new(AnalyzedWrenMDL::analyze_with_tables(manifest, registers)?);
         let properties_ref = Arc::new(HashMap::new());
-        let ctx = create_ctx_with_mdl(
+        let ctx = apply_wren_on_ctx(
             &ctx,
             Arc::clone(&analyzed_mdl),
             properties_ref,
@@ -1433,7 +1532,7 @@ mod test {
         +---------------------------------------------+-----------------------------------------------+
         | arrow_typeof(timestamp_table.timestamp_col) | arrow_typeof(timestamp_table.timestamptz_col) |
         +---------------------------------------------+-----------------------------------------------+
-        | Timestamp(Nanosecond, None)                 | Timestamp(Nanosecond, Some("UTC"))            |
+        | Timestamp(ns)                               | Timestamp(ns, "UTC")                          |
         +---------------------------------------------+-----------------------------------------------+
         "#);
         Ok(())
@@ -1441,7 +1540,7 @@ mod test {
 
     #[tokio::test]
     async fn test_coercion_timestamptz() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         ctx.register_batch("timestamp_table", timestamp_table())?;
         for timezone_type in [
             "timestamptz",
@@ -1468,7 +1567,7 @@ mod test {
             )?);
             let sql = r#"select timestamp_col = timestamptz_col from wren.test.timestamp_table"#;
             let actual = transform_sql_with_ctx(
-                &SessionContext::new(),
+                &create_wren_ctx(None, None),
                 Arc::clone(&analyzed_mdl),
                 &[],
                 Arc::new(HashMap::new()),
@@ -1483,7 +1582,7 @@ mod test {
 
             let sql = r#"select timestamptz_col > cast('2011-01-01 18:00:00' as TIMESTAMP WITH TIME ZONE) from wren.test.timestamp_table"#;
             let actual = transform_sql_with_ctx(
-                &SessionContext::new(),
+                &create_wren_ctx(None, None),
                 Arc::clone(&analyzed_mdl),
                 &[],
                 Arc::new(HashMap::new()),
@@ -1497,7 +1596,7 @@ mod test {
 
             let sql = r#"select timestamptz_col > '2011-01-01 18:00:00' from wren.test.timestamp_table"#;
             let actual = transform_sql_with_ctx(
-                &SessionContext::new(),
+                &create_wren_ctx(None, None),
                 Arc::clone(&analyzed_mdl),
                 &[],
                 Arc::new(HashMap::new()),
@@ -1512,7 +1611,7 @@ mod test {
 
             let sql = r#"select timestamp_col > cast('2011-01-01 18:00:00' as TIMESTAMP WITH TIME ZONE) from wren.test.timestamp_table"#;
             let actual = transform_sql_with_ctx(
-                &SessionContext::new(),
+                &create_wren_ctx(None, None),
                 Arc::clone(&analyzed_mdl),
                 &[],
                 Arc::new(HashMap::new()),
@@ -1528,7 +1627,7 @@ mod test {
 
     #[tokio::test]
     async fn test_list() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -1559,126 +1658,8 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_struct() -> Result<()> {
-        let ctx = SessionContext::new();
-        let manifest = ManifestBuilder::new()
-            .catalog("wren")
-            .schema("test")
-            .model(
-                ModelBuilder::new("struct_table")
-                    .table_reference("struct_table")
-                    .column(
-                        ColumnBuilder::new(
-                            "struct_col",
-                            "struct<float_field float,time_field timestamp>",
-                        )
-                        .build(),
-                    )
-                    .column(
-                        ColumnBuilder::new(
-                            "struct_array_col",
-                            "array<struct<float_field float,time_field timestamp>>",
-                        )
-                        .build(),
-                    )
-                    .build(),
-            )
-            .build();
-        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
-            manifest,
-            Arc::new(HashMap::default()),
-            Mode::Unparse,
-        )?);
-        let sql = "select struct_col.float_field from wren.test.struct_table";
-        let actual = transform_sql_with_ctx(
-            &ctx,
-            Arc::clone(&analyzed_mdl),
-            &[],
-            Arc::new(HashMap::new()),
-            sql,
-        )
-        .await?;
-        assert_snapshot!(
-            actual,
-            @"SELECT struct_table.struct_col.float_field FROM \
-        (SELECT struct_table.struct_col FROM (SELECT __source.struct_col AS struct_col \
-        FROM struct_table AS __source) AS struct_table) AS struct_table"
-        );
-
-        let sql = "select struct_array_col[1].float_field from wren.test.struct_table";
-        let actual = transform_sql_with_ctx(
-            &ctx,
-            Arc::clone(&analyzed_mdl),
-            &[],
-            Arc::new(HashMap::new()),
-            sql,
-        )
-        .await?;
-        assert_snapshot!(actual, @"SELECT struct_table.struct_array_col[1].float_field FROM \
-        (SELECT struct_table.struct_array_col FROM (SELECT __source.struct_array_col AS struct_array_col \
-        FROM struct_table AS __source) AS struct_table) AS struct_table");
-
-        let sql =
-            "select {float_field: 1.0, time_field: timestamp '2021-01-01 00:00:00'}";
-        let actual = transform_sql_with_ctx(
-            &ctx,
-            Arc::clone(&analyzed_mdl),
-            &[],
-            Arc::new(HashMap::new()),
-            sql,
-        )
-        .await?;
-        assert_snapshot!(actual, @"SELECT {float_field: 1.0, time_field: CAST('2021-01-01 00:00:00' AS TIMESTAMP)}");
-
-        let manifest = ManifestBuilder::new()
-            .catalog("wren")
-            .schema("test")
-            .model(
-                ModelBuilder::new("struct_table")
-                    .table_reference("struct_table")
-                    .column(ColumnBuilder::new("struct_col", "struct<>").build())
-                    .build(),
-            )
-            .build();
-        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
-            manifest,
-            Arc::new(HashMap::default()),
-            Mode::Unparse,
-        )?);
-        let sql = "select struct_col.float_field from wren.test.struct_table";
-        let _ = transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::new(HashMap::new()), sql)
-            .await
-            .map_err(|e| {
-                assert_snapshot!(
-                    e.to_string(),
-                    @"Execution error: The expression to get an indexed field is only valid for `Struct`, `Map` or `Null` types, got Utf8"
-                )
-            });
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_disable_common_expression_eliminate() -> Result<()> {
-        let ctx = SessionContext::new();
-        let sql =
-            "SELECT CAST(TIMESTAMP '2021-01-01 00:00:00' as TIMESTAMP WITH TIME ZONE) = \
-        CAST(TIMESTAMP '2021-01-01 00:00:00' as TIMESTAMP WITH TIME ZONE)";
-        let result = transform_sql_with_ctx(
-            &ctx,
-            Arc::new(AnalyzedWrenMDL::default()),
-            &[],
-            Arc::new(HashMap::new()),
-            sql,
-        )
-        .await?;
-        assert_snapshot!(result, @"SELECT CAST(CAST('2021-01-01 00:00:00' AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE) = \
-        CAST(CAST('2021-01-01 00:00:00' AS TIMESTAMP) AS TIMESTAMP WITH TIME ZONE)");
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn test_disable_eliminate_nested_union() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let sql = r#"SELECT * FROM (SELECT 1 x, 'a' y UNION ALL
     SELECT 1 x, 'b' y UNION ALL
     SELECT 2 x, 'a' y UNION ALL
@@ -1709,7 +1690,7 @@ mod test {
             Arc::new(HashMap::default()),
             Mode::Unparse,
         )?);
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let sql = "SELECT trim(' abc')";
         let actual = transform_sql_with_ctx(
             &ctx,
@@ -1725,7 +1706,7 @@ mod test {
 
     #[tokio::test]
     async fn test_disable_single_distinct_to_group_by() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -1763,7 +1744,7 @@ mod test {
 
     #[tokio::test]
     async fn test_disable_distinct_to_group_by() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -1798,7 +1779,7 @@ mod test {
 
     #[tokio::test]
     async fn test_disable_scalar_subquery() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -1826,14 +1807,14 @@ mod test {
         .await?;
         assert_snapshot!(
             result,
-            @"SELECT customer.c_custkey, (SELECT customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_custkey AS BIGINT) = 1) FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer) AS customer"
+            @"SELECT customer.c_custkey, (SELECT customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer WHERE customer.c_custkey = 1) FROM (SELECT customer.c_custkey FROM (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer) AS customer"
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_wildcard_where() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -1861,7 +1842,7 @@ mod test {
         .await?;
         assert_snapshot!(
             result,
-            @"SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_custkey AS BIGINT) = 1"
+            @"SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer WHERE customer.c_custkey = 1"
         );
         Ok(())
     }
@@ -1895,7 +1876,7 @@ mod test {
         }
         "#;
         let manifest: Manifest = serde_json::from_str(mdl_json).unwrap();
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let sql = r#"SELECT * FROM customer WHERE c_custkey = 1"#;
         let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
             manifest,
@@ -1912,7 +1893,7 @@ mod test {
         .await?;
         assert_snapshot!(
             result,
-            @r#"SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM "remote".test."CUSTOMER" AS __source) AS customer) AS customer WHERE CAST(customer.c_custkey AS BIGINT) = 1"#
+            @r#"SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM "remote".test."CUSTOMER" AS __source) AS customer) AS customer WHERE customer.c_custkey = 1"#
         );
         Ok(())
     }
@@ -1946,7 +1927,7 @@ mod test {
         }
         "#;
         let manifest: Manifest = serde_json::from_str(mdl_json).unwrap();
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let sql = r#"SELECT * FROM customer WHERE c_custkey = 1"#;
         let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
             manifest,
@@ -1963,14 +1944,14 @@ mod test {
         .await?;
         assert_snapshot!(
             result,
-            @r#"SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM "遠端".test."客戶" AS __source) AS customer) AS customer WHERE CAST(customer.c_custkey AS BIGINT) = 1"#
+            @r#"SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM "遠端".test."客戶" AS __source) AS customer) AS customer WHERE customer.c_custkey = 1"#
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_rlac_with_requried_properties() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         // test required property
         let manifest = ManifestBuilder::new()
@@ -1999,7 +1980,7 @@ mod test {
             build_headers(&[("session_nation".to_string(), Some("1".to_string()))]);
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::new(headers), sql).await?,
-            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1) AS customer"
+            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1) AS customer"
         );
 
         match transform_sql_with_ctx(
@@ -2065,13 +2046,13 @@ mod test {
         ]));
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers.clone(), sql,).await?,
-            @"SELECT customer.c_custkey, customer.c_nationkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1 AND customer.c_name = 'Gura') AS customer"
+            @"SELECT customer.c_custkey, customer.c_nationkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1 AND customer.c_name = 'Gura') AS customer"
         );
 
         let sql = "SELECT * FROM customer WHERE c_custkey = 1";
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql).await?,
-            @"SELECT customer.c_custkey, customer.c_nationkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1 AND customer.c_name = 'Gura') AS customer WHERE CAST(customer.c_custkey AS BIGINT) = 1"
+            @"SELECT customer.c_custkey, customer.c_nationkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1 AND customer.c_name = 'Gura') AS customer WHERE customer.c_custkey = 1"
         );
 
         // test other model won't be affected
@@ -2088,7 +2069,7 @@ mod test {
         ]));
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql).await?,
-            @"SELECT orders.o_orderkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1 AND customer.c_name = 'Gura') AS customer INNER JOIN (SELECT orders.o_custkey, orders.o_orderkey FROM (SELECT __source.o_custkey AS o_custkey, __source.o_orderkey AS o_orderkey FROM orders AS __source) AS orders) AS orders ON customer.c_custkey = orders.o_custkey"
+            @"SELECT orders.o_orderkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1 AND customer.c_name = 'Gura') AS customer INNER JOIN (SELECT orders.o_custkey, orders.o_orderkey FROM (SELECT __source.o_custkey AS o_custkey, __source.o_orderkey AS o_orderkey FROM orders AS __source) AS orders) AS orders ON customer.c_custkey = orders.o_custkey"
         );
 
         // test property is required
@@ -2145,7 +2126,7 @@ mod test {
         ]));
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql).await?,
-            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1 AND customer.c_name = 'Peko') AS customer"
+            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1 AND customer.c_name = 'Peko') AS customer"
         );
 
         // expect ignore the rule because session_user is optional without default value
@@ -2182,7 +2163,7 @@ mod test {
 
     #[tokio::test]
     async fn test_rlac_with_optional_properties() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         // test required property
         let manifest = ManifestBuilder::new()
@@ -2217,12 +2198,12 @@ mod test {
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql)
                 .await?,
-            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1) AS customer"
+            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1) AS customer"
         );
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::new(HashMap::new()), sql)
                 .await?,
-            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 3) AS customer"
+            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 3) AS customer"
         );
 
         let manifest = ManifestBuilder::new()
@@ -2253,7 +2234,7 @@ mod test {
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql)
                 .await?,
-            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1) AS customer"
+            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1) AS customer"
         );
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::new(HashMap::new()), sql)
@@ -2295,7 +2276,7 @@ mod test {
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql)
                 .await?,
-            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1 AND customer.c_name = 'Gura') AS customer"
+            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1 AND customer.c_name = 'Gura') AS customer"
         );
         // the rule is expected to be skipped because the optional property is None without default value
         let headers = Arc::new(build_headers(&[(
@@ -2351,7 +2332,7 @@ mod test {
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql)
                 .await?,
-            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1 AND customer.c_name = 'Gura') AS customer"
+            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1 AND customer.c_name = 'Gura') AS customer"
         );
         // the rule is expected to be skipped because the optional property is None without default value
         let headers = Arc::new(build_headers(&[(
@@ -2373,7 +2354,7 @@ mod test {
 
     #[tokio::test]
     async fn test_rlac_on_calculated_field() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         let manifest = ManifestBuilder::new()
             .catalog("wren")
@@ -2438,7 +2419,7 @@ mod test {
         let sql = "SELECT * FROM orders where o_orderkey > 10";
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql).await?,
-            @"SELECT orders.o_orderkey, orders.o_custkey, orders.customer_name FROM (SELECT orders.customer_name, orders.o_custkey, orders.o_orderkey FROM (SELECT __relation__1.c_name AS customer_name, __relation__1.o_custkey, __relation__1.o_orderkey FROM (SELECT customer.c_custkey, customer.c_name, orders.o_custkey, orders.o_orderkey FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer) AS customer RIGHT OUTER JOIN (SELECT __source.o_custkey AS o_custkey, __source.o_orderkey AS o_orderkey FROM orders AS __source) AS orders ON customer.c_custkey = orders.o_custkey) AS __relation__1) AS orders WHERE orders.customer_name = 'Gura') AS orders WHERE CAST(orders.o_orderkey AS BIGINT) > 10"
+            @"SELECT orders.o_orderkey, orders.o_custkey, orders.customer_name FROM (SELECT orders.customer_name, orders.o_custkey, orders.o_orderkey FROM (SELECT __relation__1.c_name AS customer_name, __relation__1.o_custkey, __relation__1.o_orderkey FROM (SELECT customer.c_custkey, customer.c_name, orders.o_custkey, orders.o_orderkey FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer) AS customer RIGHT OUTER JOIN (SELECT __source.o_custkey AS o_custkey, __source.o_orderkey AS o_orderkey FROM orders AS __source) AS orders ON customer.c_custkey = orders.o_custkey) AS __relation__1) AS orders WHERE orders.customer_name = 'Gura') AS orders WHERE orders.o_orderkey > 10"
         );
 
         let manifest = ManifestBuilder::new()
@@ -2520,7 +2501,7 @@ mod test {
         // test custoer model used by customer_name should be filtered by nation rule.
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql).await?,
-            @"SELECT orders.customer_name FROM (SELECT __relation__1.c_name AS customer_name FROM (SELECT customer.c_custkey, customer.c_name, orders.o_custkey FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1) AS customer) AS customer RIGHT OUTER JOIN (SELECT __source.o_custkey AS o_custkey FROM orders AS __source) AS orders ON customer.c_custkey = orders.o_custkey) AS __relation__1) AS orders"
+            @"SELECT orders.customer_name FROM (SELECT __relation__1.c_name AS customer_name FROM (SELECT customer.c_custkey, customer.c_name, orders.o_custkey FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1) AS customer) AS customer RIGHT OUTER JOIN (SELECT __source.o_custkey AS o_custkey FROM orders AS __source) AS orders ON customer.c_custkey = orders.o_custkey) AS __relation__1) AS orders"
         );
         let headers = Arc::new(build_headers(&[(
             "session_user".to_string(),
@@ -2530,21 +2511,21 @@ mod test {
         // test orders model used by totalprice should be filtered by user rule.
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
-            @"SELECT customer.totalprice FROM (SELECT __relation__1.totalprice FROM (SELECT totalprice.c_custkey, totalprice.totalprice FROM (SELECT __relation__1.c_custkey AS c_custkey, sum(CAST(__relation__1.o_totalprice AS BIGINT)) AS totalprice FROM (SELECT customer.c_custkey, orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT __source.o_custkey AS o_custkey, __source.o_totalprice AS o_totalprice FROM orders AS __source) AS orders) AS orders WHERE CAST(orders.o_custkey AS BIGINT) = 1) AS orders) AS orders RIGHT OUTER JOIN (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer ON orders.o_custkey = customer.c_custkey) AS __relation__1 GROUP BY __relation__1.c_custkey) AS totalprice RIGHT OUTER JOIN (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer ON totalprice.c_custkey = customer.c_custkey) AS __relation__1) AS customer",
+            @"SELECT customer.totalprice FROM (SELECT __relation__1.totalprice FROM (SELECT totalprice.c_custkey, totalprice.totalprice FROM (SELECT __relation__1.c_custkey AS c_custkey, sum(CAST(__relation__1.o_totalprice AS BIGINT)) AS totalprice FROM (SELECT customer.c_custkey, orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT __source.o_custkey AS o_custkey, __source.o_totalprice AS o_totalprice FROM orders AS __source) AS orders) AS orders WHERE orders.o_custkey = 1) AS orders) AS orders RIGHT OUTER JOIN (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer ON orders.o_custkey = customer.c_custkey) AS __relation__1 GROUP BY __relation__1.c_custkey) AS totalprice RIGHT OUTER JOIN (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer ON totalprice.c_custkey = customer.c_custkey) AS __relation__1) AS customer",
         );
 
         let sql = "SELECT totalprice FROM customer c";
         // test orders model used by totalprice should be filtered by user rule.
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql).await?,
-            @"SELECT c.totalprice FROM (SELECT __relation__1.totalprice FROM (SELECT totalprice.c_custkey, totalprice.totalprice FROM (SELECT __relation__1.c_custkey AS c_custkey, sum(CAST(__relation__1.o_totalprice AS BIGINT)) AS totalprice FROM (SELECT customer.c_custkey, orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT __source.o_custkey AS o_custkey, __source.o_totalprice AS o_totalprice FROM orders AS __source) AS orders) AS orders WHERE CAST(orders.o_custkey AS BIGINT) = 1) AS orders) AS orders RIGHT OUTER JOIN (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer ON orders.o_custkey = customer.c_custkey) AS __relation__1 GROUP BY __relation__1.c_custkey) AS totalprice RIGHT OUTER JOIN (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer ON totalprice.c_custkey = customer.c_custkey) AS __relation__1) AS c",
+            @"SELECT c.totalprice FROM (SELECT __relation__1.totalprice FROM (SELECT totalprice.c_custkey, totalprice.totalprice FROM (SELECT __relation__1.c_custkey AS c_custkey, sum(CAST(__relation__1.o_totalprice AS BIGINT)) AS totalprice FROM (SELECT customer.c_custkey, orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT orders.o_custkey, orders.o_totalprice FROM (SELECT __source.o_custkey AS o_custkey, __source.o_totalprice AS o_totalprice FROM orders AS __source) AS orders) AS orders WHERE orders.o_custkey = 1) AS orders) AS orders RIGHT OUTER JOIN (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer ON orders.o_custkey = customer.c_custkey) AS __relation__1 GROUP BY __relation__1.c_custkey) AS totalprice RIGHT OUTER JOIN (SELECT __source.c_custkey AS c_custkey FROM customer AS __source) AS customer ON totalprice.c_custkey = customer.c_custkey) AS __relation__1) AS c",
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_rlac_alias_model() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -2588,7 +2569,7 @@ mod test {
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql)
                 .await?,
-            @"SELECT c.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1) AS c"
+            @"SELECT c.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1) AS c"
         );
 
         let headers = Arc::new(build_headers(&[
@@ -2600,14 +2581,14 @@ mod test {
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql)
                 .await?,
-            @"SELECT c.c_name FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1) AS c INNER JOIN (SELECT orders.o_custkey FROM (SELECT orders.o_custkey FROM (SELECT __source.o_custkey AS o_custkey FROM orders AS __source) AS orders) AS orders WHERE CAST(orders.o_custkey AS BIGINT) = 1) AS o ON c.c_custkey = o.o_custkey"
+            @"SELECT c.c_name FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT customer.c_custkey, customer.c_name, customer.c_nationkey FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1) AS c INNER JOIN (SELECT orders.o_custkey FROM (SELECT orders.o_custkey FROM (SELECT __source.o_custkey AS o_custkey FROM orders AS __source) AS orders) AS orders WHERE orders.o_custkey = 1) AS o ON c.c_custkey = o.o_custkey"
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_rlac_unicode_model_column_name() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -2646,8 +2627,56 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_ralc_condition_contain_hidden() -> Result<()> {
+        let ctx = create_wren_ctx(None, None);
+
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("customer")
+                    .table_reference("customer")
+                    .column(ColumnBuilder::new("c_custkey", "int").build())
+                    .column(ColumnBuilder::new("c_name", "string").hidden(true).build())
+                    .add_row_level_access_control(
+                        "hidden condition",
+                        vec![],
+                        "c_name = 'Peko'",
+                    )
+                    .build(),
+            )
+            .build();
+
+        let headers = SessionPropertiesRef::default();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest.clone(),
+            headers.clone(),
+            Mode::Unparse,
+        )?);
+        let sql = "SELECT * FROM customer";
+
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT customer.c_custkey FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT customer.c_custkey, customer.c_name FROM (SELECT __source.c_custkey AS c_custkey, __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer WHERE customer.c_name = 'Peko') AS customer"
+        );
+
+        // assert the hidden column can't be used directly
+        let sql = "SELECT c_name FROm customer";
+        match transform_sql_with_ctx(&ctx, analyzed_mdl, &[], headers, sql).await {
+            Ok(_) => panic!("Expected error"),
+            Err(e) => {
+                assert_snapshot!(
+                    e.to_string(),
+                    @"Schema error: No field named c_name. Valid fields are customer.c_custkey."
+                )
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_clac_with_required_properties() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         let manifest = ManifestBuilder::new()
             .catalog("wren")
@@ -2660,7 +2689,7 @@ mod test {
                         ColumnBuilder::new("c_name", "string")
                             .column_level_access_control(
                                 "cls rule",
-                                vec![SessionProperty::new_required("session_level")],
+                                vec![SessionProperty::new_required("Session_level")],
                                 ColumnLevelOperator::Equals,
                                 "1",
                             )
@@ -2704,7 +2733,7 @@ mod test {
             Err(e) => {
                 assert_snapshot!(
                     e.to_string(),
-                    @"Error during planning: session property session_level is required for `cls rule` rule but not found in headers"
+                    @"Error during planning: session property Session_level is required for `cls rule` rule but not found in headers"
                 )
             }
             _ => panic!("Expected error"),
@@ -2744,7 +2773,7 @@ mod test {
 
     #[tokio::test]
     async fn test_clac_permission_denied() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -2817,7 +2846,7 @@ mod test {
 
     #[tokio::test]
     async fn test_calc_primary_key() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -2859,7 +2888,7 @@ mod test {
 
     #[tokio::test]
     async fn test_clac_with_optional_properties() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         let manifest = ManifestBuilder::new()
             .catalog("wren")
@@ -2967,7 +2996,7 @@ mod test {
 
     #[tokio::test]
     async fn test_clac_on_calculated_field() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         let manifest = ManifestBuilder::new()
             .catalog("wren")
@@ -3119,7 +3148,7 @@ mod test {
 
     #[tokio::test]
     async fn test_rlac_case_insensitive() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         // test required property
         let manifest = ManifestBuilder::new()
@@ -3150,14 +3179,14 @@ mod test {
         )]));
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql).await?,
-            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE CAST(customer.c_nationkey AS BIGINT) = 1) AS customer"
+            @"SELECT customer.c_nationkey, customer.c_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer WHERE customer.c_nationkey = 1) AS customer"
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_disable_eliminate_limit() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         // test required property
         let manifest = ManifestBuilder::new()
@@ -3187,7 +3216,7 @@ mod test {
 
     #[tokio::test]
     async fn test_default_nulls_last() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
 
         // test required property
         let manifest = ManifestBuilder::new()
@@ -3248,7 +3277,7 @@ mod test {
 
     #[tokio::test]
     async fn test_extract_roundtrip_bigquery() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, Some(&DataSource::BigQuery));
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -3306,92 +3335,45 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_date_diff_bigquery() -> Result<()> {
-        let ctx = SessionContext::new();
+    async fn test_window_function_frame() -> Result<()> {
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
             .model(
-                ModelBuilder::new("date_table")
-                    .table_reference("date_table")
-                    .column(ColumnBuilder::new("date_1", "date").build())
-                    .column(ColumnBuilder::new("date_2", "date").build())
+                ModelBuilder::new("orders")
+                    .table_reference("orders")
+                    .column(ColumnBuilder::new("o_orderkey", "int").build())
+                    .column(ColumnBuilder::new("o_custkey", "int").build())
+                    .column(ColumnBuilder::new("o_orderdate", "date").build())
                     .build(),
             )
-            .model(
-                ModelBuilder::new("timestamp_table")
-                    .table_reference("timestamp_table")
-                    .column(ColumnBuilder::new("ts_1", "timestamp").build())
-                    .column(ColumnBuilder::new("ts_2", "timestamp").build())
-                    .build(),
-            )
-            .data_source(DataSource::BigQuery)
             .build();
         let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
             manifest,
             Arc::new(HashMap::default()),
             Mode::Unparse,
         )?);
-
-        let sql = "select date_diff(DAY, date_1, date_2) from date_table";
-        let headers: Arc<HashMap<String, Option<String>>> = Arc::new(HashMap::default());
+        let headers = Arc::new(HashMap::default());
+        // assert default won't generate the window frame
+        let sql = "SELECT rank() OVER (PARTITION BY o_custkey ORDER BY o_orderdate) FROM orders";
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
-            @"SELECT DATE_DIFF(date_table.date_2, date_table.date_1, DAY) FROM (SELECT date_table.date_1, date_table.date_2 FROM (SELECT __source.date_1 AS date_1, __source.date_2 AS date_2 FROM date_table AS __source) AS date_table) AS date_table"
+            @"SELECT rank() OVER (PARTITION BY orders.o_custkey ORDER BY orders.o_orderdate ASC NULLS LAST) FROM (SELECT orders.o_custkey, orders.o_orderdate FROM (SELECT __source.o_custkey AS o_custkey, __source.o_orderdate AS o_orderdate FROM orders AS __source) AS orders) AS orders"
         );
 
-        let sql = "select datediff(DAY, date_1, date_2) from date_table";
-        let headers: Arc<HashMap<String, Option<String>>> = Arc::new(HashMap::default());
+        // assert generate window frame if given
+        let sql = "SELECT count(*) OVER (PARTITION BY o_custkey ORDER BY o_orderdate ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) as window_col FROM orders";
         assert_snapshot!(
             transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
-            @"SELECT DATE_DIFF(date_table.date_2, date_table.date_1, DAY) FROM (SELECT date_table.date_1, date_table.date_2 FROM (SELECT __source.date_1 AS date_1, __source.date_2 AS date_2 FROM date_table AS __source) AS date_table) AS date_table"
-        );
-        let sql = "select datediff('DAY', date_1, date_2) from date_table";
-        let headers: Arc<HashMap<String, Option<String>>> = Arc::new(HashMap::default());
-        assert_snapshot!(
-            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
-            @"SELECT DATE_DIFF(date_table.date_2, date_table.date_1, DAY) FROM (SELECT date_table.date_1, date_table.date_2 FROM (SELECT __source.date_1 AS date_1, __source.date_2 AS date_2 FROM date_table AS __source) AS date_table) AS date_table"
-        );
-
-        let sql = "select datediff(DAY, date_1, date_2) from date_table";
-        let headers: Arc<HashMap<String, Option<String>>> = Arc::new(HashMap::default());
-        assert_snapshot!(
-            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
-            @"SELECT DATE_DIFF(date_table.date_2, date_table.date_1, DAY) FROM (SELECT date_table.date_1, date_table.date_2 FROM (SELECT __source.date_1 AS date_1, __source.date_2 AS date_2 FROM date_table AS __source) AS date_table) AS date_table"
-        );
-
-        let sql = "select datediff('DAYS', date_1, date_2) from date_table";
-        let headers: Arc<HashMap<String, Option<String>>> = Arc::new(HashMap::default());
-        match transform_sql_with_ctx(
-            &ctx,
-            Arc::clone(&analyzed_mdl),
-            &[],
-            Arc::clone(&headers),
-            sql,
-        )
-        .await
-        {
-            Ok(_) => {
-                panic!("Expected error, but got SQL");
-            }
-            Err(e) => assert_snapshot!(
-                e.to_string(),
-                @"Error during planning: Unsupported date part 'DAYS' for BIGQUERY. Valid values are: WEEK, DAYOFWEEK, DAY, DAYOFYEAR, ISOWEEK, MONTH, QUARTER, YEAR, ISOYEAR, MICROSECOND, MILLISECOND, SECOND, MINUTE, HOUR"
-            ),
-        }
-
-        let sql = "select datediff(HOUR, ts_1, ts_2) from timestamp_table";
-        let headers: Arc<HashMap<String, Option<String>>> = Arc::new(HashMap::default());
-        assert_snapshot!(
-            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
-            @"SELECT DATE_DIFF(timestamp_table.ts_2, timestamp_table.ts_1, HOUR) FROM (SELECT timestamp_table.ts_1, timestamp_table.ts_2 FROM (SELECT __source.ts_1 AS ts_1, __source.ts_2 AS ts_2 FROM timestamp_table AS __source) AS timestamp_table) AS timestamp_table"
+            @"SELECT count(1) OVER (PARTITION BY orders.o_custkey ORDER BY orders.o_orderdate ASC NULLS LAST ROWS BETWEEN 1 PRECEDING AND 2 FOLLOWING) AS window_col FROM (SELECT orders.o_custkey, orders.o_orderdate FROM (SELECT __source.o_custkey AS o_custkey, __source.o_orderdate AS o_orderdate FROM orders AS __source) AS orders) AS orders"
         );
         Ok(())
     }
 
     #[tokio::test]
     async fn test_window_functions_without_frame_bigquery() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -3421,7 +3403,7 @@ mod test {
 
     #[tokio::test]
     async fn test_cte_used_in_scalar_subquery() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -3464,7 +3446,7 @@ mod test {
 
     #[tokio::test]
     async fn test_ambiguous_table_name() -> Result<()> {
-        let ctx = SessionContext::new();
+        let ctx = create_wren_ctx(None, None);
         let manifest = ManifestBuilder::new()
             .catalog("wren")
             .schema("test")
@@ -3522,6 +3504,340 @@ mod test {
             ),
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_unicode_literal() -> Result<()> {
+        let ctx = create_wren_ctx(None, None);
+
+        let manifest = ManifestBuilder::default().build();
+        let properties = SessionPropertiesRef::default();
+        let mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::clone(&properties),
+            Mode::Unparse,
+        )?);
+        let sql = "select 'ZUTOMAYO', '永遠是深夜有多好'";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&mdl), &[], Arc::clone(&properties), sql).await?,
+            @"SELECT 'ZUTOMAYO', '永遠是深夜有多好'"
+        );
+
+        let manifest = ManifestBuilder::default()
+            .data_source(DataSource::MSSQL)
+            .build();
+        let properties = SessionPropertiesRef::default();
+        let mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::clone(&properties),
+            Mode::Unparse,
+        )?);
+        let sql = "select 'ZUTOMAYO', '永遠是深夜有多好'";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&mdl), &[], Arc::clone(&properties), sql).await?,
+            @"SELECT 'ZUTOMAYO', '永遠是深夜有多好'"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_compatible_type() -> Result<()> {
+        let ctx = create_wren_ctx(None, None);
+
+        let manifest = ManifestBuilder::default().build();
+        let properties = SessionPropertiesRef::default();
+        let mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::clone(&properties),
+            Mode::Unparse,
+        )?);
+        let sql = "select cast(1 as int64)";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&mdl), &[], Arc::clone(&properties), sql).await?,
+            @"SELECT CAST(1 AS BIGINT)"
+        );
+        Ok(())
+    }
+
+    // bigquery and mssql will transform trim to trim, others to btrim
+    #[tokio::test]
+    async fn test_trim_function_bigquery_and_mssql() -> Result<()> {
+        let ctx = create_wren_ctx(None, Some(&DataSource::BigQuery));
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("customer")
+                    .table_reference("customer")
+                    .column(ColumnBuilder::new("c_custkey", "int").build())
+                    .column(ColumnBuilder::new("c_name", "string").build())
+                    .build(),
+            )
+            .data_source(DataSource::BigQuery)
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let headers = Arc::new(HashMap::default());
+        let sql = "SELECT trim(c_name) FROM customer";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT trim(customer.c_name) FROM (SELECT customer.c_name FROM (SELECT __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer"
+        );
+
+        let ctx = create_wren_ctx(None, Some(&DataSource::MSSQL));
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("customer")
+                    .table_reference("customer")
+                    .column(ColumnBuilder::new("c_custkey", "int").build())
+                    .column(ColumnBuilder::new("c_name", "string").build())
+                    .build(),
+            )
+            .data_source(DataSource::MSSQL)
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+
+        let headers = Arc::new(HashMap::default());
+        let sql = "SELECT trim(c_name) FROM customer";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT trim(customer.c_name) FROM (SELECT customer.c_name FROM (SELECT __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer"
+        );
+
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("customer")
+                    .table_reference("customer")
+                    .column(ColumnBuilder::new("c_custkey", "int").build())
+                    .column(ColumnBuilder::new("c_name", "string").build())
+                    .build(),
+            )
+            .data_source(DataSource::MSSQL)
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+
+        let headers = Arc::new(HashMap::default());
+        let sql = "SELECT trim(c_name) FROM customer";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT trim(customer.c_name) FROM (SELECT customer.c_name FROM (SELECT __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer"
+        );
+
+        let ctx = create_wren_ctx(None, None);
+        // normal data source will be transformed to btrim
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("customer")
+                    .table_reference("customer")
+                    .column(ColumnBuilder::new("c_custkey", "int").build())
+                    .column(ColumnBuilder::new("c_name", "string").build())
+                    .build(),
+            )
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let headers = Arc::new(HashMap::default());
+        let sql = "SELECT trim(c_name) FROM customer";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT btrim(customer.c_name) FROM (SELECT customer.c_name FROM (SELECT __source.c_name AS c_name FROM customer AS __source) AS customer) AS customer"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_to_char() -> Result<()> {
+        let ctx = create_wren_ctx(None, None);
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("customer")
+                    .table_reference("customer")
+                    .column(ColumnBuilder::new("c_date", "date").build())
+                    .column(ColumnBuilder::new("c_timestamp", "timestamp").build())
+                    .column(ColumnBuilder::new("c_timestamptz", "timestamptz").build())
+                    .column(ColumnBuilder::new("c_int", "int").build())
+                    .column(ColumnBuilder::new("c_bigint", "bigint").build())
+                    .column(ColumnBuilder::new("c_float", "float").build())
+                    .column(ColumnBuilder::new("c_double", "double").build())
+                    .column(ColumnBuilder::new("c_decimal", "decimal").build())
+                    .build(),
+            )
+            .data_source(DataSource::BigQuery)
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let headers = Arc::new(HashMap::default());
+        let sql = "SELECT to_char(c_date, '%Y-%m-%d'), to_char(c_timestamp, '%Y-%m-%d'), to_char(c_timestamptz, '%Y-%m-%d') FROM customer";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT to_char(customer.c_date, '%Y-%m-%d'), to_char(customer.c_timestamp, '%Y-%m-%d'), to_char(customer.c_timestamptz, '%Y-%m-%d') FROM (SELECT customer.c_date, customer.c_timestamp, customer.c_timestamptz FROM (SELECT __source.c_date AS c_date, __source.c_timestamp AS c_timestamp, __source.c_timestamptz AS c_timestamptz FROM customer AS __source) AS customer) AS customer"
+        );
+
+        let sql = "SELECT to_char(c_int, '999'), to_char(c_bigint, '999'), to_char(c_float, '999.99'), to_char(c_double, '999.99'), to_char(c_decimal, '999.99') FROM customer";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT to_char(customer.c_int, '999'), to_char(customer.c_bigint, '999'), to_char(customer.c_float, '999.99'), to_char(customer.c_double, '999.99'), to_char(customer.c_decimal, '999.99') FROM (SELECT customer.c_bigint, customer.c_decimal, customer.c_double, customer.c_float, customer.c_int FROM (SELECT __source.c_bigint AS c_bigint, __source.c_decimal AS c_decimal, __source.c_double AS c_double, __source.c_float AS c_float, __source.c_int AS c_int FROM customer AS __source) AS customer) AS customer"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_disable_eliminate_cross_join() -> Result<()> {
+        let ctx = create_wren_ctx(None, None);
+
+        // test required property
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("customer")
+                    .table_reference("customer")
+                    .column(ColumnBuilder::new("c_nationkey", "int").build())
+                    .column(ColumnBuilder::new("c_name", "string").build())
+                    .build(),
+            )
+            .model(
+                ModelBuilder::new("nation")
+                    .table_reference("nation")
+                    .column(ColumnBuilder::new("n_nationkey", "int").build())
+                    .column(ColumnBuilder::new("n_name", "string").build())
+                    .build(),
+            )
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let sql = "SELECT * FROM customer, nation WHERE customer.c_nationkey = nation.n_nationkey";
+        let headers = Arc::new(HashMap::default());
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], headers, sql).await?,
+            @"SELECT customer.c_nationkey, customer.c_name, nation.n_nationkey, nation.n_name FROM (SELECT customer.c_name, customer.c_nationkey FROM (SELECT __source.c_name AS c_name, __source.c_nationkey AS c_nationkey FROM customer AS __source) AS customer) AS customer CROSS JOIN (SELECT nation.n_name, nation.n_nationkey FROM (SELECT __source.n_name AS n_name, __source.n_nationkey AS n_nationkey FROM nation AS __source) AS nation) AS nation WHERE customer.c_nationkey = nation.n_nationkey"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snowflake_unnest() -> Result<()> {
+        let ctx = create_wren_ctx(None, Some(&DataSource::Snowflake));
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("orders")
+                    .table_reference("orders")
+                    .column(ColumnBuilder::new("o_items", "array<string>").build())
+                    .build(),
+            )
+            .data_source(DataSource::Snowflake)
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let headers = Arc::new(HashMap::default());
+        let sql = "SELECT item FROM orders o, unnest(o.o_items) as t(item)";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT t.item FROM (SELECT orders.o_items FROM (SELECT __source.o_items AS o_items FROM orders AS __source) AS orders) AS o CROSS JOIN UNNEST(o.o_items) AS t (item)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_extract_roundtrip_mysql() -> Result<()> {
+        let ctx = create_wren_ctx(None, Some(&DataSource::MySQL));
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("orders")
+                    .table_reference("orders")
+                    .column(ColumnBuilder::new("o_orderdate", "date").build())
+                    .build(),
+            )
+            .data_source(DataSource::MySQL)
+            .build();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let headers = Arc::new(HashMap::default());
+        let sql = "SELECT EXTRACT(YEAR FROM o_orderdate) FROM orders";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT EXTRACT(YEAR FROM orders.o_orderdate) FROM (SELECT orders.o_orderdate FROM (SELECT __source.o_orderdate AS o_orderdate FROM orders AS __source) AS orders) AS orders"
+        );
+
+        let sql = "SELECT EXTRACT(WEEK FROM o_orderdate) FROM orders";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @"SELECT EXTRACT(WEEK FROM orders.o_orderdate) FROM (SELECT orders.o_orderdate FROM (SELECT __source.o_orderdate AS o_orderdate FROM orders AS __source) AS orders) AS orders"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_bigquery_json() -> Result<()> {
+        let ctx = create_wren_ctx(None, Some(&DataSource::BigQuery));
+        let manifest = ManifestBuilder::new()
+            .catalog("wren")
+            .schema("test")
+            .model(
+                ModelBuilder::new("json_table")
+                    .table_reference("json_table")
+                    .column(ColumnBuilder::new("json_col", "json").build())
+                    .build(),
+            )
+            .data_source(DataSource::BigQuery)
+            .build();
+        let headers = SessionPropertiesRef::default();
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+        let sql = "SELECT GET_PATH(json_col, '$.field') FROM json_table";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @r#"SELECT JSON_EXTRACT("json_table".json_col, '$.field') FROM (SELECT "json_table".json_col FROM (SELECT __source.json_col AS json_col FROM "json_table" AS __source) AS "json_table") AS "json_table""#
+        );
+
+        let sql = "SELECT AS_ARRAY(GET_PATH(json_col, '$.field')) FROM json_table";
+        assert_snapshot!(
+            transform_sql_with_ctx(&ctx, Arc::clone(&analyzed_mdl), &[], Arc::clone(&headers), sql).await?,
+            @r#"SELECT JSON_EXTRACT_ARRAY("json_table".json_col, '$.field') FROM (SELECT "json_table".json_col FROM (SELECT __source.json_col AS json_col FROM "json_table" AS __source) AS "json_table") AS "json_table""#
+        );
         Ok(())
     }
 
@@ -3602,8 +3918,288 @@ mod test {
     ) -> HashMap<String, Option<String>> {
         let mut headers = HashMap::new();
         for (key, value) in field {
-            headers.insert(key.clone(), value.clone());
+            headers.insert(key.to_lowercase(), value.clone());
         }
         headers
+    }
+
+    #[tokio::test]
+    async fn test_analyze_with_url_tables_rejects_non_file_datasource() {
+        let manifest = ManifestBuilder::new()
+            .data_source(DataSource::BigQuery)
+            .model(
+                ModelBuilder::new("test")
+                    .table_reference(r#""file:///tmp/test.parquet""#)
+                    .column(ColumnBuilder::new("id", "int").build())
+                    .build(),
+            )
+            .build();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let result = AnalyzedWrenMDL::analyze_with_url_tables(manifest, &ctx).await;
+        match result {
+            Err(e) => assert!(
+                e.to_string().contains("Only file-based data source"),
+                "unexpected error: {e}"
+            ),
+            Ok(_) => panic!("expected error for non-file data source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_analyze_with_url_tables_allows_no_datasource() {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::datatypes::{DataType, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        // Write a small Parquet file to a temp path
+        let dir = std::env::temp_dir().join("wren_test_url_tables_no_ds");
+        let _ = std::fs::create_dir_all(&dir);
+        let parquet_path = dir.join("data.parquet");
+
+        let schema =
+            Arc::new(Schema::new(vec![datafusion::arrow::datatypes::Field::new(
+                "id",
+                DataType::Int32,
+                false,
+            )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
+        )
+        .unwrap();
+        let file = std::fs::File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Manifest with NO data_source set — should be allowed
+        let url = format!("\"{}\"", parquet_path.display());
+        let manifest = ManifestBuilder::new()
+            .model(
+                ModelBuilder::new("test")
+                    .table_reference(&url)
+                    .column(ColumnBuilder::new("id", "int").build())
+                    .build(),
+            )
+            .build();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let result = AnalyzedWrenMDL::analyze_with_url_tables(manifest, &ctx).await;
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result.err());
+        let analyzed = result.unwrap();
+        assert!(analyzed.wren_mdl().get_model("test").is_some());
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_analyze_with_url_tables_local_file_datasource() {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::datatypes::{DataType, Schema};
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let dir = std::env::temp_dir().join("wren_test_url_tables_local");
+        let _ = std::fs::create_dir_all(&dir);
+        let parquet_path = dir.join("orders.parquet");
+
+        let schema = Arc::new(Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new("order_id", DataType::Int32, false),
+            datafusion::arrow::datatypes::Field::new("amount", DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let file = std::fs::File::create(&parquet_path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let url = format!("\"{}\"", parquet_path.display());
+        let manifest = ManifestBuilder::new()
+            .data_source(DataSource::LocalFile)
+            .model(
+                ModelBuilder::new("orders")
+                    .table_reference(&url)
+                    .column(ColumnBuilder::new("order_id", "int").build())
+                    .column(ColumnBuilder::new("amount", "int").build())
+                    .build(),
+            )
+            .build();
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        let analyzed = AnalyzedWrenMDL::analyze_with_url_tables(manifest, &ctx)
+            .await
+            .expect("analyze_with_url_tables should succeed for LocalFile");
+
+        // Verify the model exists and the table is registered
+        assert!(analyzed.wren_mdl().get_model("orders").is_some());
+        assert!(
+            analyzed.wren_mdl().register_tables.contains_key(&url),
+            "table should be registered with its quoted table_reference"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_ref_sql_model() -> Result<()> {
+        let mdl_json = r#"
+        {
+            "catalog": "wren",
+            "schema": "test",
+            "models": [
+                {
+                    "name": "revenue_summary",
+                    "refSql": "SELECT region, SUM(amount) AS total FROM raw_sales GROUP BY region",
+                    "columns": [
+                        {
+                            "name": "region",
+                            "type": "string"
+                        },
+                        {
+                            "name": "total",
+                            "type": "int"
+                        }
+                    ]
+                }
+            ]
+        }
+        "#;
+        let manifest: Manifest = serde_json::from_str(mdl_json).unwrap();
+        let ctx = create_wren_ctx(None, None);
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+
+        // Simple SELECT on refSql model
+        let sql = r#"SELECT region, total FROM revenue_summary"#;
+        let result = transform_sql_with_ctx(
+            &ctx,
+            Arc::clone(&analyzed_mdl),
+            &[],
+            Arc::new(HashMap::new()),
+            sql,
+        )
+        .await?;
+        // The refSql should appear as a subquery in the output
+        assert!(
+            result.contains(
+                "SELECT region, SUM(amount) AS total FROM raw_sales GROUP BY region"
+            ),
+            "Expected refSql subquery in output, got: {result}"
+        );
+
+        // SELECT with WHERE filter on refSql model
+        let sql = r#"SELECT region FROM revenue_summary WHERE total > 100"#;
+        let result = transform_sql_with_ctx(
+            &ctx,
+            Arc::clone(&analyzed_mdl),
+            &[],
+            Arc::new(HashMap::new()),
+            sql,
+        )
+        .await?;
+        assert!(
+            result.contains(
+                "SELECT region, SUM(amount) AS total FROM raw_sales GROUP BY region"
+            ),
+            "Expected refSql subquery in filtered output, got: {result}"
+        );
+        assert!(
+            result.contains("total > 100"),
+            "Expected WHERE filter in output, got: {result}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_ref_sql_model_with_table_ref_model() -> Result<()> {
+        let mdl_json = r#"
+        {
+            "catalog": "wren",
+            "schema": "test",
+            "models": [
+                {
+                    "name": "orders",
+                    "tableReference": {
+                        "table": "orders"
+                    },
+                    "columns": [
+                        {
+                            "name": "o_orderkey",
+                            "type": "int"
+                        },
+                        {
+                            "name": "o_totalprice",
+                            "type": "float"
+                        }
+                    ]
+                },
+                {
+                    "name": "order_summary",
+                    "refSql": "SELECT o_orderkey, SUM(o_totalprice) AS total FROM orders GROUP BY o_orderkey",
+                    "columns": [
+                        {
+                            "name": "o_orderkey",
+                            "type": "int"
+                        },
+                        {
+                            "name": "total",
+                            "type": "float"
+                        }
+                    ]
+                }
+            ]
+        }
+        "#;
+        let manifest: Manifest = serde_json::from_str(mdl_json).unwrap();
+        let ctx = create_wren_ctx(None, None);
+        let analyzed_mdl = Arc::new(AnalyzedWrenMDL::analyze(
+            manifest,
+            Arc::new(HashMap::default()),
+            Mode::Unparse,
+        )?);
+
+        // Query the refSql model — coexistence with table_reference model
+        let sql = r#"SELECT o_orderkey, total FROM order_summary"#;
+        let result = transform_sql_with_ctx(
+            &ctx,
+            Arc::clone(&analyzed_mdl),
+            &[],
+            Arc::new(HashMap::new()),
+            sql,
+        )
+        .await?;
+        assert!(
+            result.contains("SELECT o_orderkey, SUM(o_totalprice) AS total FROM orders GROUP BY o_orderkey"),
+            "Expected refSql subquery in output, got: {result}"
+        );
+
+        // Query the table_reference model — should still work normally
+        let sql = r#"SELECT o_orderkey FROM orders"#;
+        let result = transform_sql_with_ctx(
+            &ctx,
+            Arc::clone(&analyzed_mdl),
+            &[],
+            Arc::new(HashMap::new()),
+            sql,
+        )
+        .await?;
+        assert!(
+            !result.contains("refSql"),
+            "Table reference model output should not contain refSql, got: {result}"
+        );
+
+        Ok(())
     }
 }

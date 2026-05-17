@@ -14,7 +14,9 @@
 import base64
 import json
 import os
-from app.model import MySqlConnectionInfo, OracleConnectionInfo, PostgresConnectionInfo
+from app.custom_sqlglot.dialects.wren import Wren
+from app.model import BigQueryDatasetConnectionInfo, DorisConnectionInfo, MSSqlConnectionInfo, MySqlConnectionInfo, OracleConnectionInfo, PostgresConnectionInfo, SnowflakeConnectionInfo
+from app.model.connector import BigQueryConnector
 from app.util import to_json
 import sqlglot
 import sys
@@ -22,7 +24,6 @@ import pandas as pd
 
 from dotenv import load_dotenv
 from wren_core import SessionContext
-from app.model.data_source import BigQueryConnectionInfo
 from app.model.data_source import DataSourceExtension
 import wren_core
 
@@ -76,27 +77,40 @@ properties = frozenset(properties.items())
 print("### Session Properties ###")
 for key, value in properties:
     print(f"# {key}: {value}")
-session_context = SessionContext(encoded_str, function_list_path + f"/{data_source}.csv", properties)
+session_context = SessionContext(encoded_str, function_list_path + f"/{data_source}.csv", properties, data_source)
 planned_sql = session_context.transform_sql(sql)
 print("# Planned SQL:\n", planned_sql)
 
 # Transpile the planned SQL
-dialect_sql = sqlglot.transpile(planned_sql, read=None, write=data_source)[0]
+if data_source == "mssql":
+    # For mssql, we need to use the "tsql" dialect for reading
+    dialect_sql = sqlglot.transpile(planned_sql, read=Wren, write="tsql")[0]
+else:
+    dialect_sql = sqlglot.transpile(planned_sql, read=Wren, write=data_source)[0]
 print("# Dialect SQL:\n", dialect_sql)
 print("#")
 
 if data_source == "bigquery":
-    connection_info = BigQueryConnectionInfo.model_validate_json(json.dumps(connection_info))
-    connection = DataSourceExtension.get_bigquery_connection(connection_info)
+    connection_info = BigQueryDatasetConnectionInfo.model_validate_json(json.dumps(connection_info))
+    connection = BigQueryConnector(connection_info)
 elif data_source == "mysql":
     connection_info = MySqlConnectionInfo.model_validate_json(json.dumps(connection_info))
     connection = DataSourceExtension.get_mysql_connection(connection_info)
+elif data_source == "doris":
+    connection_info = DorisConnectionInfo.model_validate_json(json.dumps(connection_info))
+    connection = DataSourceExtension.get_doris_connection(connection_info)
 elif data_source == "postgres":
     connection_info = PostgresConnectionInfo.model_validate_json(json.dumps(connection_info))
     connection = DataSourceExtension.get_postgres_connection(connection_info)
 elif data_source == "oracle":
     connection_info = OracleConnectionInfo.model_validate_json(json.dumps(connection_info))
     connection = DataSourceExtension.get_oracle_connection(connection_info)
+elif data_source == "mssql":
+    connection_info = MSSqlConnectionInfo.model_validate_json(json.dumps(connection_info))
+    connection = DataSourceExtension.get_mssql_connection(connection_info)
+elif data_source == "snowflake":
+    connection_info = SnowflakeConnectionInfo.model_validate_json(json.dumps(connection_info))
+    connection = DataSourceExtension.get_snowflake_connection(connection_info)
 else:
     raise Exception("Unsupported data source:", data_source)
 

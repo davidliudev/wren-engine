@@ -2,11 +2,13 @@ import base64
 import importlib
 import os
 import time
+from abc import ABC, abstractmethod
 from contextlib import closing, suppress
 from decimal import Decimal as PyDecimal
 from functools import cache
 from json import loads
 from typing import Any
+from urllib.parse import urlparse
 
 try:
     import clickhouse_connect
@@ -22,11 +24,15 @@ import ibis
 import ibis.expr.datatypes as dt
 import ibis.expr.schema as sch
 import opendal
+import oracledb
 import pandas as pd
 import psycopg
 import pyarrow as pa
 import sqlglot.expressions as sge
 import trino
+from databricks import sql as dbsql
+from databricks.sdk.core import Config as DbConfig
+from databricks.sdk.core import oauth_service_principal
 from duckdb import HTTPException, IOException
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -37,15 +43,21 @@ from ibis.expr.datatypes.core import UUID
 from ibis.expr.types import Table
 from loguru import logger
 from opentelemetry import trace
+from pyspark.sql import SparkSession
+from sqlglot import exp, parse_one
 
 from app.model import (
     ConnectionInfo,
+    DatabricksConnectionUnion,
+    DatabricksServicePrincipalConnectionInfo,
+    DatabricksTokenConnectionInfo,
     GcsFileConnectionInfo,
     MinioFileConnectionInfo,
     RedshiftConnectionInfo,
     RedshiftConnectionUnion,
     RedshiftIAMConnectionInfo,
     S3FileConnectionInfo,
+    SparkConnectionInfo,
 )
 from app.model.data_source import DataSource
 from app.model.error import (
@@ -60,6 +72,120 @@ from app.model.utils import init_duckdb_gcs, init_duckdb_minio, init_duckdb_s3
 importlib.import_module("app.custom_ibis.backends.sql.datatypes")
 
 tracer = trace.get_tracer(__name__)
+
+
+def _ora_number_type(precision, scale) -> pa.DataType:
+    if scale is not None and scale > 0:
+        p = min(int(precision), 38) if precision else 38
+        s = int(scale)
+        return pa.decimal128(p, s)
+    if precision is not None and precision > 0 and precision <= 9:
+        return pa.int32()
+    return pa.int64()
+
+
+def _get_ora_type_map() -> dict:
+    return {
+        oracledb.DB_TYPE_CHAR: pa.string(),
+        oracledb.DB_TYPE_NCHAR: pa.string(),
+        oracledb.DB_TYPE_VARCHAR: pa.string(),
+        oracledb.DB_TYPE_NVARCHAR: pa.string(),
+        oracledb.DB_TYPE_LONG: pa.large_string(),
+        oracledb.DB_TYPE_DATE: pa.date32(),
+        oracledb.DB_TYPE_TIMESTAMP: pa.timestamp("us"),
+        oracledb.DB_TYPE_TIMESTAMP_TZ: pa.timestamp("us", tz="UTC"),
+        oracledb.DB_TYPE_TIMESTAMP_LTZ: pa.timestamp("us", tz="UTC"),
+        oracledb.DB_TYPE_CLOB: pa.large_string(),
+        oracledb.DB_TYPE_NCLOB: pa.large_string(),
+        oracledb.DB_TYPE_BLOB: pa.binary(),
+        oracledb.DB_TYPE_RAW: pa.binary(),
+        oracledb.DB_TYPE_LONG_RAW: pa.binary(),
+        oracledb.DB_TYPE_BINARY_FLOAT: pa.float32(),
+        oracledb.DB_TYPE_BINARY_DOUBLE: pa.float64(),
+        oracledb.DB_TYPE_ROWID: pa.string(),
+        oracledb.DB_TYPE_UROWID: pa.string(),
+    }
+
+
+def _build_ora_column(values: list, arrow_type: pa.DataType) -> pa.Array:
+    coerced = []
+    for v in values:
+        if v is None:
+            coerced.append(None)
+        elif hasattr(v, "read"):
+            # LOB objects (CLOB, NCLOB, BLOB) — read content on demand
+            coerced.append(v.read())
+        elif isinstance(v, memoryview):
+            coerced.append(bytes(v))
+        elif pa.types.is_decimal(arrow_type) and isinstance(v, float):
+            # oracledb returns float for NUMBER(p,s) without an explicit CAST;
+            # PyArrow decimal128 requires int or Decimal, not float.
+            coerced.append(PyDecimal(str(v)))
+        elif arrow_type in (pa.float64(), pa.float32()) and isinstance(v, int | float):
+            coerced.append(float(v))
+        else:
+            coerced.append(v)
+    return pa.array(coerced, type=arrow_type)
+
+
+def _build_oracle_arrow_table(cursor) -> pa.Table:
+    if cursor.description is None:
+        return pa.table({})
+    type_map = _get_ora_type_map()
+    rows = cursor.fetchall()
+    n_cols = len(cursor.description)
+    col_values: list[list] = [[] for _ in range(n_cols)]
+    for row in rows:
+        for i, val in enumerate(row):
+            col_values[i].append(val)
+    arrays = []
+    names = []
+    for i, desc in enumerate(cursor.description):
+        col_name = desc[0]
+        db_type = desc[1]
+        precision = desc[4]
+        scale = desc[5]
+        if db_type == oracledb.DB_TYPE_NUMBER:
+            arrow_type = _ora_number_type(precision, scale)
+        else:
+            arrow_type = type_map.get(db_type, pa.string())
+        names.append(col_name)
+        arrays.append(_build_ora_column(col_values[i], arrow_type))
+    return pa.Table.from_arrays(arrays, names=names)
+
+
+def _make_oracle_connection(connection_info) -> oracledb.Connection:
+    if hasattr(connection_info, "connection_url") and connection_info.connection_url:
+        url = connection_info.connection_url.get_secret_value()
+        parsed = urlparse(url)
+        return oracledb.connect(
+            user=parsed.username,
+            password=parsed.password,
+            host=parsed.hostname,
+            port=parsed.port or 1521,
+            service_name=parsed.path.lstrip("/"),
+        )
+    if hasattr(connection_info, "dsn") and connection_info.dsn:
+        return oracledb.connect(
+            user=connection_info.user.get_secret_value(),
+            password=(
+                connection_info.password.get_secret_value()
+                if connection_info.password
+                else None
+            ),
+            dsn=connection_info.dsn.get_secret_value(),
+        )
+    return oracledb.connect(
+        user=connection_info.user.get_secret_value(),
+        password=(
+            connection_info.password.get_secret_value()
+            if connection_info.password
+            else None
+        ),
+        host=connection_info.host.get_secret_value(),
+        port=int(connection_info.port.get_secret_value()),
+        service_name=connection_info.database.get_secret_value(),
+    )
 
 
 @cache
@@ -82,14 +208,25 @@ class Connector:
             DataSource.s3_file,
             DataSource.minio_file,
             DataSource.gcs_file,
+            DataSource.duckdb,
         }:
             self._connector = DuckDBConnector(connection_info)
         elif data_source == DataSource.redshift:
             self._connector = RedshiftConnector(connection_info)
         elif data_source == DataSource.postgres:
             self._connector = PostgresConnector(connection_info)
+        elif data_source == DataSource.spark:
+            self._connector = SparkConnector(connection_info)
+        elif data_source == DataSource.databricks:
+            self._connector = DatabricksConnector(connection_info)
+        elif data_source == DataSource.mysql:
+            self._connector = MySqlConnector(connection_info)
+        elif data_source == DataSource.doris:
+            self._connector = DorisConnector(connection_info)
+        elif data_source == DataSource.oracle:
+            self._connector = OracleConnector(connection_info)
         else:
-            self._connector = SimpleConnector(data_source, connection_info)
+            self._connector = IbisConnector(data_source, connection_info)
 
     def query(self, sql: str, limit: int | None = None) -> pa.Table:
         try:
@@ -118,6 +255,13 @@ class Connector:
                     metadata={DIALECT_SQL: sql},
                 ) from e
             raise e
+        except oracledb.DatabaseError as e:
+            raise WrenError(
+                ErrorCode.INVALID_SQL,
+                str(e),
+                phase=ErrorPhase.SQL_EXECUTION,
+                metadata={DIALECT_SQL: sql},
+            ) from e
         except Exception as e:
             raise WrenError(
                 ErrorCode.GENERIC_USER_ERROR,
@@ -153,6 +297,13 @@ class Connector:
                     metadata={DIALECT_SQL: sql},
                 ) from e
             raise
+        except oracledb.DatabaseError as e:
+            raise WrenError(
+                ErrorCode.INVALID_SQL,
+                str(e),
+                phase=ErrorPhase.SQL_DRY_RUN,
+                metadata={DIALECT_SQL: sql},
+            ) from e
         except Exception as e:
             raise WrenError(
                 ErrorCode.GENERIC_USER_ERROR,
@@ -171,7 +322,21 @@ class Connector:
             )
 
 
-class SimpleConnector:
+class ConnectorABC(ABC):
+    @abstractmethod
+    def query(self, sql: str, limit: int | None = None) -> pa.Table:
+        pass
+
+    @abstractmethod
+    def dry_run(self, sql: str) -> None:
+        pass
+
+    @abstractmethod
+    def close(self) -> None:
+        pass
+
+
+class IbisConnector(ConnectorABC):
     def __init__(self, data_source: DataSource, connection_info: ConnectionInfo):
         self.data_source = data_source
         self.connection = self.data_source.get_connection(connection_info)
@@ -233,6 +398,9 @@ class SimpleConnector:
             elif hasattr(self.connection, "close"):
                 # Try to close the connection directly if it has a close method
                 self.connection.close()
+            elif hasattr(self.connection, "disconnect"):
+                # Some backends use disconnect instead of close
+                self.connection.disconnect()
             else:
                 logger.warning(
                     f"Closing connection for {self.data_source.value} is not implemented."
@@ -247,7 +415,7 @@ class SimpleConnector:
             self.connection = None
 
 
-class PostgresConnector(SimpleConnector):
+class PostgresConnector(IbisConnector):
     def __init__(self, connection_info):
         super().__init__(DataSource.postgres, connection_info)
 
@@ -291,12 +459,113 @@ class PostgresConnector(SimpleConnector):
             self.connection = None
 
 
-class MSSqlConnector(SimpleConnector):
+class MySqlConnector(IbisConnector):
+    def __init__(self, connection_info: ConnectionInfo):
+        super().__init__(DataSource.mysql, connection_info)
+
+    def _handle_pyarrow_unsupported_type(self, ibis_table: Table, **kwargs) -> Table:
+        result_table = ibis_table
+        for name, dtype in ibis_table.schema().items():
+            if isinstance(dtype, Decimal):
+                # Round decimal columns to a specified scale
+                result_table = self._round_decimal_columns(
+                    result_table=result_table, col_name=name, **kwargs
+                )
+            elif isinstance(dtype, UUID):
+                # Convert UUID to string for compatibility
+                result_table = self._cast_uuid_columns(
+                    result_table=result_table, col_name=name
+                )
+            elif isinstance(dtype, dt.JSON):
+                # ibis doesn't handle JSON type for MySQL properly.
+                # We need to convert JSON columns to string for compatibility manually.
+                result_table = self._cast_json_columns(
+                    result_table=result_table, col_name=name
+                )
+
+        return result_table
+
+    def _cast_json_columns(self, result_table: Table, col_name: str) -> Table:
+        col = result_table[col_name]
+        # Convert JSON to string for compatibility
+        casted_col = col.cast("string")
+        return result_table.mutate(**{col_name: casted_col})
+
+
+class DorisConnector(IbisConnector):
+    """Doris connector - reuses MySQL protocol via ibis.mysql backend.
+
+    Doris is an analytical database that is MySQL-protocol compatible.
+    Autocommit is forced on in get_doris_connection() because Doris may not
+    properly reflect the SERVER_STATUS_AUTOCOMMIT flag, which would cause
+    ibis's raw_sql() to wrap every query in BEGIN/ROLLBACK unnecessarily.
+    """
+
+    def __init__(self, connection_info: ConnectionInfo):
+        super().__init__(DataSource.doris, connection_info)
+
+    def _handle_pyarrow_unsupported_type(self, ibis_table: Table, **kwargs) -> Table:
+        result_table = ibis_table
+        for name, dtype in ibis_table.schema().items():
+            if isinstance(dtype, Decimal):
+                result_table = self._round_decimal_columns(
+                    result_table=result_table, col_name=name, **kwargs
+                )
+            elif isinstance(dtype, UUID):
+                result_table = self._cast_uuid_columns(
+                    result_table=result_table, col_name=name
+                )
+            elif isinstance(dtype, dt.JSON):
+                # Doris JSON columns need the same handling as MySQL
+                result_table = self._cast_json_columns(
+                    result_table=result_table, col_name=name
+                )
+
+        return result_table
+
+    def _cast_json_columns(self, result_table: Table, col_name: str) -> Table:
+        col = result_table[col_name]
+        casted_col = col.cast("string")
+        return result_table.mutate(**{col_name: casted_col})
+
+
+class OracleConnector(ConnectorABC):
+    def __init__(self, connection_info):
+        self._closed = False
+        self.connection = _make_oracle_connection(connection_info)
+
+    @tracer.start_as_current_span("connector_query", kind=trace.SpanKind.CLIENT)
+    def query(self, sql: str, limit: int | None = None) -> pa.Table:
+        if limit is not None:
+            sql = f"SELECT * FROM ({sql}) t WHERE ROWNUM <= {limit}"
+        with closing(self.connection.cursor()) as cursor:
+            cursor.execute(sql)
+            return _build_oracle_arrow_table(cursor)
+
+    @tracer.start_as_current_span("connector_dry_run", kind=trace.SpanKind.CLIENT)
+    def dry_run(self, sql: str) -> None:
+        with closing(self.connection.cursor()) as cursor:
+            cursor.execute(f"SELECT * FROM ({sql}) t WHERE ROWNUM <= 0")
+
+    def close(self) -> None:
+        if self._closed or not hasattr(self, "connection") or self.connection is None:
+            return
+        try:
+            self.connection.close()
+        except Exception as e:
+            logger.warning(f"Error closing Oracle connection: {e}")
+        finally:
+            self._closed = True
+            self.connection = None
+
+
+class MSSqlConnector(IbisConnector):
     def __init__(self, connection_info: ConnectionInfo):
         super().__init__(DataSource.mssql, connection_info)
 
     @tracer.start_as_current_span("connector_query", kind=trace.SpanKind.CLIENT)
     def query(self, sql: str, limit: int | None = None) -> pa.Table:
+        sql = self._flatten_pagination_limit(sql)
         ibis_table = self.connection.sql(sql)
         if limit is not None:
             ibis_table = ibis_table.limit(limit)
@@ -325,6 +594,60 @@ class MSSqlConnector(SimpleConnector):
 
         arrow_table = pa.Table.from_pandas(pandas_df)
         return arrow_table
+
+    # TODO: we should implement analyze rule to rewrite mssql pagination queries
+    # Match: SELECT * FROM (<inner_sql>) AS _paginated_table LIMIT n [OFFSET m]
+    def _flatten_pagination_limit(
+        self, sql_query: str, input_dialect: str = "tsql"
+    ) -> str:
+        try:
+            parsed = parse_one(sql_query, dialect=input_dialect)
+            # Must be a SELECT
+            if not isinstance(parsed, exp.Select):
+                return sql_query
+            # Must have a LIMIT
+            if not parsed.args.get("limit"):
+                return sql_query
+
+            from_clause = parsed.find(exp.From)
+            if not from_clause:
+                return sql_query
+
+            subqueries = []
+
+            # Case 1: Single FROM subquery
+            if isinstance(from_clause.this, exp.Subquery):
+                subqueries.append(from_clause.this)
+
+            # Case 2: Comma-separated or JOIN-based FROM
+            joins = parsed.args.get("joins")
+            if joins:
+                for join in joins:
+                    if isinstance(join, exp.Join):
+                        if isinstance(join.this, exp.Subquery):
+                            subqueries.append(join.this)
+                        if join.expression and isinstance(
+                            join.expression, exp.Subquery
+                        ):
+                            subqueries.append(join.expression)
+
+            # Only flatten if exactly one subquery is present
+            if len(subqueries) != 1:
+                return sql_query
+
+            subquery = subqueries[0]
+            inner = subquery.this
+            if not isinstance(inner, exp.Select):
+                return sql_query
+
+            # Transfer LIMIT to inner query
+            limit_expr = parsed.args["limit"].expression
+            inner.set("limit", exp.Limit(expression=limit_expr))
+
+            return inner.sql(dialect="tsql")
+
+        except Exception as e:
+            return f"Error: {e!s}"
 
     def dry_run(self, sql: str) -> None:
         try:
@@ -358,7 +681,7 @@ class MSSqlConnector(SimpleConnector):
             return rows[0][0]
 
 
-class CannerConnector:
+class CannerConnector(IbisConnector):
     def __init__(self, connection_info: ConnectionInfo):
         self.connection = DataSource.canner.get_connection(connection_info)
 
@@ -421,53 +744,53 @@ class CannerConnector:
         return postgres_compiler.type_mapper.from_string(type_name)
 
 
-class BigQueryConnector(SimpleConnector):
+class BigQueryConnector(ConnectorABC):
     def __init__(self, connection_info: ConnectionInfo):
-        super().__init__(DataSource.bigquery, connection_info)
+        self.data_source = DataSource.bigquery
         self.connection_info = connection_info
+        credits_json = loads(
+            base64.b64decode(
+                self.connection_info.credentials.get_secret_value()
+            ).decode("utf-8")
+        )
+        credentials = service_account.Credentials.from_service_account_info(
+            credits_json
+        )
+        credentials = credentials.with_scopes(
+            [
+                "https://www.googleapis.com/auth/drive",
+                "https://www.googleapis.com/auth/cloud-platform",
+            ]
+        )
+        client = bigquery.Client(
+            credentials=credentials,
+            project=connection_info.get_billing_project_id(),
+        )
+        job_config = bigquery.QueryJobConfig()
+        job_config.job_timeout_ms = self.connection_info.job_timeout_ms
+        client.default_query_job_config = job_config
+        self.connection = client
 
+    @tracer.start_as_current_span("connector_query", kind=trace.SpanKind.CLIENT)
     def query(self, sql: str, limit: int | None = None) -> pa.Table:
+        return self.connection.query(sql).result(max_results=limit).to_arrow()
+
+    @tracer.start_as_current_span("connector_dry_run", kind=trace.SpanKind.CLIENT)
+    def dry_run(self, sql: str) -> None:
+        self.connection.query(
+            sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
+        )
+
+    @tracer.start_as_current_span("connector_close", kind=trace.SpanKind.CLIENT)
+    def close(self) -> None:
+        """Close the BigQuery connection."""
         try:
-            return super().query(sql, limit)
-        except ValueError as e:
-            # Import here to avoid override the custom datatypes
-            import ibis.backends.bigquery  # noqa: PLC0415
-
-            # Try to match the error message from the google cloud bigquery library matching Arrow type error.
-            # If the error message matches, requries to get the schema from the result and generate a empty pandas dataframe with the mapped schema
-            #
-            # It's a workaround for the issue that the ibis library does not support empty result for some special types (e.g. JSON or Interval)
-            # see details:
-            # - https://github.com/Canner/wren-engine/issues/909
-            # - https://github.com/ibis-project/ibis/issues/10612
-            if "Must pass schema" in str(e):
-                with tracer.start_as_current_span(
-                    "get_schema", kind=trace.SpanKind.CLIENT
-                ):
-                    credits_json = loads(
-                        base64.b64decode(
-                            self.connection_info.credentials.get_secret_value()
-                        ).decode("utf-8")
-                    )
-                    credentials = service_account.Credentials.from_service_account_info(
-                        credits_json
-                    )
-                    credentials = credentials.with_scopes(
-                        [
-                            "https://www.googleapis.com/auth/drive",
-                            "https://www.googleapis.com/auth/cloud-platform",
-                        ]
-                    )
-                    client = bigquery.Client(credentials=credentials)
-                    ibis_schema_mapper = ibis.backends.bigquery.BigQuerySchema()
-                    bq_fields = client.query(sql).result()
-                    ibis_fields = ibis_schema_mapper.to_ibis(bq_fields.schema)
-                    return pd.DataFrame(columns=ibis_fields.names)
-            else:
-                raise e
+            self.connection.close()
+        except Exception as e:
+            logger.warning(f"Error closing BigQuery connection: {e}")
 
 
-class DuckDBConnector:
+class DuckDBConnector(ConnectorABC):
     def __init__(self, connection_info: ConnectionInfo):
         import duckdb  # noqa: PLC0415
 
@@ -548,7 +871,7 @@ class DuckDBConnector:
             logger.warning(f"Error closing DuckDB connection: {e}")
 
 
-class RedshiftConnector:
+class RedshiftConnector(ConnectorABC):
     def __init__(self, connection_info: RedshiftConnectionUnion):
         import redshift_connector  # noqa: PLC0415
 
@@ -602,3 +925,107 @@ class RedshiftConnector:
             self.connection.close()
         except Exception as e:
             logger.warning(f"Error closing Redshift connection: {e}")
+
+
+class SparkConnector(ConnectorABC):
+    def __init__(self, connection_info: SparkConnectionInfo):
+        self.connection_info = connection_info
+        self.connection = self._create_session()
+        self._closed = False
+
+    def _create_session(self) -> SparkSession:
+        host = self.connection_info.host.get_secret_value()
+        port = self.connection_info.port.get_secret_value()
+
+        # Spark Connect endpoint
+        endpoint = f"sc://{host}:{port}"
+
+        builder = SparkSession.builder.remote(endpoint).appName("wren-spark-connect")
+
+        return builder.getOrCreate()
+
+    def query(self, sql: str, limit: int | None = None) -> pa.Table:
+        df = self.connection.sql(sql).toPandas()
+        # SPARK-54068 workaround: Remove non-serializable attrs
+        # PyArrow >= 22.0.0 tries to serialize DataFrame.attrs to JSON
+        # but PlanMetrics objects aren't JSON serializable
+        if hasattr(df, "attrs") and df.attrs:
+            df.attrs = {
+                k: v
+                for k, v in df.attrs.items()
+                if k not in ("metrics", "observed_metrics")
+            }
+
+        # Convert to Arrow
+        arrow_table = pa.Table.from_pandas(df)
+
+        if limit is not None:
+            arrow_table = arrow_table.slice(0, limit)
+
+        return arrow_table
+
+    def dry_run(self, sql: str) -> None:
+        self.connection.sql(sql).limit(0).count()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+
+        try:
+            # Spark Connect client-side cleanup
+            self.connection.stop()
+        except Exception:
+            pass
+        finally:
+            self._closed = True
+
+
+class DatabricksConnector(ConnectorABC):
+    def __init__(self, connection_info: DatabricksConnectionUnion):
+        if isinstance(connection_info, DatabricksTokenConnectionInfo):
+            self.connection = dbsql.connect(
+                server_hostname=connection_info.server_hostname.get_secret_value(),
+                http_path=connection_info.http_path.get_secret_value(),
+                access_token=connection_info.access_token.get_secret_value(),
+            )
+        elif isinstance(connection_info, DatabricksServicePrincipalConnectionInfo):
+            kwargs = {
+                "host": connection_info.server_hostname.get_secret_value(),
+                "client_id": connection_info.client_id.get_secret_value(),
+                "client_secret": connection_info.client_secret.get_secret_value(),
+            }
+            if connection_info.azure_tenant_id is not None:
+                kwargs["azure_tenant_id"] = (
+                    connection_info.azure_tenant_id.get_secret_value()
+                )
+
+            def credential_provider():
+                return oauth_service_principal(DbConfig(**kwargs))
+
+            self.connection = dbsql.connect(
+                server_hostname=connection_info.server_hostname.get_secret_value(),
+                http_path=connection_info.http_path.get_secret_value(),
+                credentials_provider=credential_provider,
+            )
+
+    def query(self, sql, limit=None):
+        with closing(self.connection.cursor()) as cursor:
+            cursor.execute(sql)
+
+            if limit is not None:
+                arrow_table = cursor.fetchmany_arrow(limit)
+            else:
+                arrow_table = cursor.fetchall_arrow()
+
+            return arrow_table
+
+    def dry_run(self, sql):
+        with closing(self.connection.cursor()) as cursor:
+            cursor.execute(f"SELECT * FROM ({sql}) AS sub LIMIT 0")
+
+    def close(self) -> None:
+        """Close the Databricks connection."""
+        try:
+            self.connection.close()
+        except Exception as e:
+            logger.warning(f"Error closing Databricks connection: {e}")

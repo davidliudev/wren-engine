@@ -8,8 +8,10 @@ use crate::logical_plan::analyze::expand_view::ExpandWrenViewRule;
 use crate::logical_plan::analyze::model_anlayze::ModelAnalyzeRule;
 use crate::logical_plan::analyze::model_generation::ModelGenerationRule;
 use crate::logical_plan::optimize::simplify_timestamp::TimestampSimplify;
+use crate::logical_plan::optimize::type_coercion::TypeCoercion as WrenTypeCoercion;
 use crate::logical_plan::utils::create_schema;
 use crate::mdl::manifest::Model;
+use crate::mdl::type_planner::WrenTypePlanner;
 use crate::mdl::{AnalyzedWrenMDL, SessionStateRef};
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -21,12 +23,10 @@ use datafusion::datasource::{TableProvider, TableType, ViewTable};
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::Expr;
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercion;
-use datafusion::optimizer::eliminate_cross_join::EliminateCrossJoin;
 use datafusion::optimizer::eliminate_duplicated_expr::EliminateDuplicatedExpr;
 use datafusion::optimizer::eliminate_filter::EliminateFilter;
 use datafusion::optimizer::eliminate_group_by_constant::EliminateGroupByConstant;
 use datafusion::optimizer::eliminate_join::EliminateJoin;
-use datafusion::optimizer::eliminate_one_union::EliminateOneUnion;
 use datafusion::optimizer::eliminate_outer_join::EliminateOuterJoin;
 use datafusion::optimizer::extract_equijoin_predicate::ExtractEquijoinPredicate;
 use datafusion::optimizer::filter_null_join_keys::FilterNullJoinKeys;
@@ -41,7 +41,7 @@ use parking_lot::RwLock;
 pub type SessionPropertiesRef = Arc<HashMap<String, Option<String>>>;
 
 /// Apply Wren Rules to the context for sql generation.
-pub async fn create_ctx_with_mdl(
+pub async fn apply_wren_on_ctx(
     ctx: &SessionContext,
     analyzed_mdl: Arc<AnalyzedWrenMDL>,
     properties: SessionPropertiesRef,
@@ -74,9 +74,11 @@ pub async fn create_ctx_with_mdl(
             .set("datafusion.execution.time_zone", &session_timezone)?;
     }
 
+    let type_planner = Arc::new(WrenTypePlanner::default());
     let reset_default_catalog_schema = Arc::new(RwLock::new(
         SessionStateBuilder::new_from_existing(ctx.state())
             .with_config(config.clone())
+            .with_type_planner(type_planner)
             .build(),
     ));
 
@@ -188,7 +190,7 @@ fn analyze_rule_for_local_runtime(
             session_state_ref,
             properties,
         )),
-        // [Expr::Wildcard] should be expanded before [TypeCoercion]
+        // Use DataFusion TypeCoercion for the executing purpose
         Arc::new(TypeCoercion::new()),
     ]
 }
@@ -218,7 +220,8 @@ fn analyze_rule_for_unparsing(
         // TimestampSimplify should be placed before TypeCoercion because the simplified timestamp should
         // be casted to the target type if needed
         Arc::new(TimestampSimplify::new()),
-        Arc::new(TypeCoercion::new()),
+        // Use WrenTypeCoercion for the unparsing purpose
+        Arc::new(WrenTypeCoercion::new()),
     ]
 }
 
@@ -242,13 +245,16 @@ fn optimize_rule_for_unparsing() -> Vec<Arc<dyn OptimizerRule + Send + Sync>> {
         // Arc::new(SimplifyExpressions::new()),
         Arc::new(EliminateDuplicatedExpr::new()),
         Arc::new(EliminateFilter::new()),
-        Arc::new(EliminateCrossJoin::new()),
+        // Disable EliminateCrossJoin to avoid generate invalid sql (expression should be rebased manually)
+        // Arc::new(EliminateCrossJoin::new()),
         // Disable CommonSubexprEliminate to avoid generate invalid projection plan
         // Arc::new(CommonSubexprEliminate::new()),
         // Arc::new(EliminateLimit::new()),
         Arc::new(PropagateEmptyRelation::new()),
-        // Must be after PropagateEmptyRelation
-        Arc::new(EliminateOneUnion::new()),
+        // OptimizeUnions replaces both EliminateNestedUnion and EliminateOneUnion in DataFusion 53,
+        // but it also flattens nested unions into multi-input unions which the unparser cannot handle.
+        // See https://github.com/apache/datafusion/issues/13621 for details.
+        // Arc::new(OptimizeUnions::new()),
         Arc::new(FilterNullJoinKeys::default()),
         Arc::new(EliminateOuterJoin::new()),
         // Filters can't be pushed down past Limits, we should do PushDownFilter after PushDownLimit
@@ -335,7 +341,7 @@ impl WrenDataSource {
         mode: &Mode,
     ) -> Result<Self> {
         let available_columns = model
-            .get_physical_columns()
+            .get_physical_columns(true)
             .iter()
             .map(|column| {
                 if mode.is_permission_analyze()

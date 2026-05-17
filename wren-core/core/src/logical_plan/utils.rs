@@ -6,15 +6,20 @@ use crate::mdl::{Dataset, SessionStateRef};
 use datafusion::arrow::datatypes::{
     DataType, Field, IntervalUnit, Schema, SchemaBuilder, SchemaRef, TimeUnit,
 };
-use datafusion::common::plan_err;
 use datafusion::common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
+use datafusion::common::types::{
+    logical_binary, logical_boolean, logical_date, logical_float16, logical_float32,
+    logical_float64, logical_string,
+};
+use datafusion::common::{plan_err, DFSchema, DFSchemaRef};
 use datafusion::datasource::DefaultTableSource;
 use datafusion::error::Result;
 use datafusion::logical_expr::sqlparser::ast::ArrayElemTypeDef;
 use datafusion::logical_expr::sqlparser::dialect::GenericDialect;
 use datafusion::logical_expr::{builder::LogicalTableSource, Expr, TableSource};
+use datafusion::logical_expr::{Coercion, TypeSignatureClass};
 use datafusion::sql::sqlparser::ast;
 use datafusion::sql::sqlparser::parser::Parser;
 use datafusion::sql::TableReference;
@@ -171,12 +176,23 @@ pub fn map_data_type(data_type: &str) -> Result<DataType> {
         "null" => DataType::Null,
         // Trino Compatible Types
         "varbinary" => DataType::Binary,
+        // ClickHouse Compatible Types
+        "datetime64" => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        "datetime32" => DataType::Timestamp(TimeUnit::Second, None),
+        "date32" => DataType::Date32,
+        "uint8" => DataType::UInt8,
+        "uint16" => DataType::UInt16,
+        "uint32" => DataType::UInt32,
+        "uint64" => DataType::UInt64,
+        "int16" => DataType::Int16,
+        "int32" => DataType::Int32,
         // DuckDB Compatible Types
         "blob" => DataType::Binary,
         "hugeint" => DataType::Int64, // we don't have a HUGEINT type, so we map it to Int64
         "uhugeint" => DataType::UInt64, // we don't have a UHUINT type, so we map it to UInt64
         "bit" => DataType::Boolean, // we don't have a BIT type, so we map it to Boolean
         "timestamp_ns" => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        "any" => DataType::Utf8, // we don't have an ANY type, so we map it to Utf8
         _ => {
             debug!("try parse by arrow {lower_data_type}");
             // the from_str is case sensitive, so we need to use the original string
@@ -184,6 +200,49 @@ pub fn map_data_type(data_type: &str) -> Result<DataType> {
         }
     };
     Ok(result)
+}
+
+pub fn get_coercion_type_signature(data_type: &DataType) -> Result<Coercion> {
+    match data_type {
+        DataType::Boolean => Ok(Coercion::new_exact(TypeSignatureClass::Native(
+            logical_boolean(),
+        ))),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64 => Ok(Coercion::new_exact(TypeSignatureClass::Integer)),
+        DataType::Timestamp(_, _) => {
+            Ok(Coercion::new_exact(TypeSignatureClass::Timestamp))
+        }
+        DataType::Time32(_) | DataType::Time64(_) => {
+            Ok(Coercion::new_exact(TypeSignatureClass::Time))
+        }
+        DataType::Duration(_) => Ok(Coercion::new_exact(TypeSignatureClass::Duration)),
+        DataType::Interval(_) => Ok(Coercion::new_exact(TypeSignatureClass::Interval)),
+        DataType::Binary | DataType::BinaryView | DataType::LargeBinary => Ok(
+            Coercion::new_exact(TypeSignatureClass::Native(logical_binary())),
+        ),
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Ok(
+            Coercion::new_exact(TypeSignatureClass::Native(logical_string())),
+        ),
+        DataType::Date32 | DataType::Date64 => Ok(Coercion::new_exact(
+            TypeSignatureClass::Native(logical_date()),
+        )),
+        DataType::Float16 => Ok(Coercion::new_exact(TypeSignatureClass::Native(
+            logical_float16(),
+        ))),
+        DataType::Float32 => Ok(Coercion::new_exact(TypeSignatureClass::Native(
+            logical_float32(),
+        ))),
+        DataType::Float64 => Ok(Coercion::new_exact(TypeSignatureClass::Native(
+            logical_float64(),
+        ))),
+        _ => plan_err!("Unsupported data type for coercion: {data_type}"),
+    }
 }
 
 pub fn create_schema(columns: Vec<Arc<Column>>) -> Result<SchemaRef> {
@@ -200,12 +259,34 @@ pub fn create_schema(columns: Vec<Arc<Column>>) -> Result<SchemaRef> {
     )))
 }
 
+pub fn create_df_schema(model: &Model) -> Result<DFSchemaRef> {
+    let fields: Vec<_> = model
+        .get_physical_columns(false)
+        .iter()
+        .map(|col| {
+            Ok((
+                Some(TableReference::bare(model.name())),
+                Arc::new(Field::new(
+                    col.name(),
+                    try_map_data_type(&col.r#type)?,
+                    col.not_null,
+                )),
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Arc::new(DFSchema::new_with_metadata(
+        fields,
+        HashMap::new(),
+    )?))
+}
+
 pub fn create_remote_table_source(
     model: Arc<Model>,
     mdl: &WrenMDL,
     session_state_ref: SessionStateRef,
 ) -> Result<Arc<dyn TableSource>> {
-    if let Some(table_provider) = mdl.get_table(model.table_reference()) {
+    let key = model.table_reference().unwrap_or_else(|| model.name());
+    if let Some(table_provider) = mdl.get_table(key) {
         Ok(Arc::new(DefaultTableSource::new(table_provider)))
     } else {
         let dataset = Dataset::Model(model);
@@ -326,6 +407,7 @@ pub fn expr_to_columns(
             | Expr::ScalarSubquery(_)
             | Expr::Wildcard { .. }
             | Expr::Placeholder(_) => {}
+            Expr::SetComparison(_) => {}
         }
         Ok(TreeNodeRecursion::Continue)
     })

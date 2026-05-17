@@ -1,10 +1,16 @@
-name: ibis CI
+name: ibis CI (clickhouse, mssql, mysql, local_file, cloud data warehouses)
 permissions:
   contents: read
   pull-requests: write
   
 on:
   pull_request:
+    paths:
+      - 'ibis-server/**'
+      - 'wren-core/**'
+      - 'wren-core-base/**'
+      - 'wren-core-py/**'
+      - 'wren-core-legacy/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.number }}
@@ -48,7 +54,7 @@ jobs:
           cache: 'poetry'
       - uses: extractions/setup-just@v2
       - name: Cache Cargo
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/bin/
@@ -74,7 +80,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
           AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
-        run: poetry run pytest -m "not bigquery and not snowflake and not canner and not s3_file and not gcs_file and not athena and not redshift"
+        run: poetry run pytest -m "clickhouse or mssql or mysql or local_file"
       - name: Test bigquery if need
         if: contains(github.event.pull_request.labels.*.name, 'bigquery')
         env:

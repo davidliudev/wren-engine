@@ -141,12 +141,16 @@ impl ModelPlanNodeBuilder {
         let required_fields =
             self.add_required_columns_from_session_properties(&model, required_fields)?;
 
+        // `required_fields` could contain the hidden columns, so we need to get from all physical columns.
         let required_columns =
-            model.get_physical_columns().into_iter().filter(|column| {
-                required_fields
-                    .iter()
-                    .any(|expr| is_required_column(expr, column.name()))
-            });
+            model
+                .get_physical_columns(false)
+                .into_iter()
+                .filter(|column| {
+                    required_fields
+                        .iter()
+                        .any(|expr| is_required_column(expr, column.name()))
+                });
         for column in required_columns {
             // Actually, it's only be checked in PermissionAnalyze mode.
             // In Unparse or LocalRuntime mode, an invalid column won't be registered in the table provider.
@@ -234,8 +238,9 @@ impl ModelPlanNodeBuilder {
                     self.required_calculation.push(calculation);
                     // insert the primary key to the required fields for join with the calculation
 
-                    let Some(pk_column) =
-                        model.primary_key().and_then(|pk| model.get_column(pk))
+                    let Some(pk_column) = model
+                        .primary_key()
+                        .and_then(|pk| model.get_visible_column(pk))
                     else {
                         return plan_err!(
                             "Primary key not found for model {}. To use `TO_MANY` relationship, the primary key is required for the base model.",
@@ -667,45 +672,44 @@ fn collect_model_required_fields(
         else {
             return plan_err!("Column reference not found for {c}");
         };
-        if let Dataset::Model(m) = dataset {
-            if column.is_calculated {
-                let expr_plan = if let Some(expression) = &column.expression {
-                    let Ok(expr) = create_wren_expr_for_model(
-                        expression,
-                        Arc::clone(&m),
-                        Arc::clone(&session_state_ref),
-                    ) else {
-                        // skip the semantic expression (e.g. calculated field or relationship column)
-                        debug!("Error creating expression for calculated field: {expression}");
-                        continue;
-                    };
-                    expr
-                } else {
-                    return plan_err!("Only support calculated field with expression");
-                }
-                .alias(column.name.clone());
-                debug!("Required Calculated field: {}", &expr_plan);
-                required_fields
-                    .entry(relation_ref.clone())
-                    .or_default()
-                    .insert(OrdExpr::with_column(expr_plan, column));
-            } else {
-                let expr_plan = get_remote_column_exp(
-                    &column,
+        let Dataset::Model(m) = dataset;
+        if column.is_calculated {
+            let expr_plan = if let Some(expression) = &column.expression {
+                let Ok(expr) = create_wren_expr_for_model(
+                    expression,
                     Arc::clone(&m),
-                    Arc::clone(&analyzed_wren_mdl),
                     Arc::clone(&session_state_ref),
-                    Arc::clone(&session_properties),
-                )?;
-                debug!("Required field: {}", &expr_plan);
-                required_fields
-                    .entry(relation_ref.clone())
-                    .or_default()
-                    .insert(OrdExpr::with_column(expr_plan, column));
+                ) else {
+                    // skip the semantic expression (e.g. calculated field or relationship column)
+                    debug!(
+                        "Error creating expression for calculated field: {expression}"
+                    );
+                    continue;
+                };
+                expr
+            } else {
+                return plan_err!("Only support calculated field with expression");
             }
+            .alias(column.name.clone());
+            debug!("Required Calculated field: {}", &expr_plan);
+            required_fields
+                .entry(relation_ref.clone())
+                .or_default()
+                .insert(OrdExpr::with_column(expr_plan, column));
         } else {
-            return plan_err!("Only support model as source dataset");
-        };
+            let expr_plan = get_remote_column_exp(
+                &column,
+                Arc::clone(&m),
+                Arc::clone(&analyzed_wren_mdl),
+                Arc::clone(&session_state_ref),
+                Arc::clone(&session_properties),
+            )?;
+            debug!("Required field: {}", &expr_plan);
+            required_fields
+                .entry(relation_ref.clone())
+                .or_default()
+                .insert(OrdExpr::with_column(expr_plan, column));
+        }
     }
     Ok(())
 }
@@ -916,7 +920,7 @@ impl ModelSourceNode {
                 } else {
                     Arc::clone(&model)
                 };
-                for column in model.get_physical_columns().into_iter() {
+                for column in model.get_physical_columns(false).into_iter() {
                     // skip the calculated field
                     if column.is_calculated {
                         continue;
@@ -938,16 +942,13 @@ impl ModelSourceNode {
                     )?));
                 }
             } else {
-                let Some(column) =
-                    model
-                        .get_physical_columns()
-                        .into_iter()
-                        .find(|column| match expr {
-                            Expr::Column(c) => c.name.as_str() == column.name(),
-                            Expr::Alias(alias) => alias.name.as_str() == column.name(),
-                            _ => false,
-                        })
-                else {
+                let Some(column) = model.get_physical_columns(false).into_iter().find(
+                    |column| match expr {
+                        Expr::Column(c) => c.name.as_str() == column.name(),
+                        Expr::Alias(alias) => alias.name.as_str() == column.name(),
+                        _ => false,
+                    },
+                ) else {
                     return plan_err!("Field not found {}", expr);
                 };
                 if column.is_calculated {
@@ -1052,7 +1053,9 @@ impl CalculationPlanNode {
         let Some(model) = calculation.dataset.try_as_model() else {
             return plan_err!("Only support model as source dataset");
         };
-        let Some(pk_column) = model.primary_key().and_then(|pk| model.get_column(pk))
+        let Some(pk_column) = model
+            .primary_key()
+            .and_then(|pk| model.get_visible_column(pk))
         else {
             return plan_err!("Primary key not found");
         };
@@ -1193,6 +1196,77 @@ impl UserDefinedLogicalNodeCore for PartialModelPlanNode {
         Ok(PartialModelPlanNode {
             model_node: self.model_node.clone(),
             schema: self.schema.clone(),
+        })
+    }
+}
+
+/// A logical plan node representing a model whose source is a raw SQL query (`ref_sql`).
+///
+/// Instead of scanning a physical table, this node carries the original SQL string
+/// and gets unparsed back into a subquery by [`SqlReferenceNodeUnparser`].
+#[derive(PartialEq, Eq, Hash, Debug, Clone)]
+pub struct SqlReferencePlanNode {
+    pub sql: String,
+    pub model_name: String,
+    pub schema_ref: DFSchemaRef,
+}
+
+impl SqlReferencePlanNode {
+    pub fn new(model: &Model, schema_ref: DFSchemaRef) -> Result<Self> {
+        let sql = model.ref_sql().ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "Model '{}' has no ref_sql defined",
+                model.name()
+            ))
+        })?;
+        Ok(Self {
+            sql: sql.to_string(),
+            model_name: model.name().to_string(),
+            schema_ref,
+        })
+    }
+}
+
+impl PartialOrd for SqlReferencePlanNode {
+    fn partial_cmp(&self, _other: &Self) -> Option<Ordering> {
+        None
+    }
+}
+
+impl UserDefinedLogicalNodeCore for SqlReferencePlanNode {
+    fn name(&self) -> &str {
+        "SqlReference"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        &self.schema_ref
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        self.schema_ref
+            .fields()
+            .iter()
+            .map(|field| col(field.name()))
+            .collect()
+    }
+
+    fn fmt_for_explain(&self, f: &mut Formatter) -> fmt::Result {
+        write!(
+            f,
+            "SqlReference: model={}, sql={}",
+            self.model_name, self.sql
+        )
+    }
+
+    fn with_exprs_and_inputs(&self, _: Vec<Expr>, _: Vec<LogicalPlan>) -> Result<Self> {
+        Ok(Self {
+            sql: self.sql.clone(),
+            model_name: self.model_name.clone(),
+            schema_ref: self.schema_ref.clone(),
         })
     }
 }

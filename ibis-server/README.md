@@ -1,7 +1,37 @@
-# Ibis Server Module
+# Ibis Server Module (Deprecated)
 This module is the API server of Wren Engine. It's built on top of [FastAPI](https://fastapi.tiangolo.com/). It provides several APIs for SQL queries. A SQL query will be planned by [wren-core](../wren-core/), transpiled by [sqlglot](https://github.com/tobymao/sqlglot), and then executed by [ibis](https://github.com/ibis-project/ibis) to query the database.
 
+## Note: This module is deprecated and will be removed in the future. We are migrating to a CLI tool with the same query capabilities. Please refer to [wren](../wren/) for the new CLI tool.
+
 ## Quick Start
+
+### Building the Docker Image
+
+```bash
+just docker-build                              # current platform (fast: Rust built locally)
+just docker-build linux/amd64                  # single platform
+just docker-build linux/amd64,linux/arm64 --push  # multi-arch (requires --push)
+```
+
+#### Build strategies
+
+| Scenario | Rust compilation | Speed |
+|---|---|---|
+| Target matches host platform | Built locally via `maturin + zig` | Fast (reuses host cargo cache) |
+| Cross-platform or multi-arch | Built inside Docker via BuildKit cache mounts | Slow on first build, incremental after |
+
+**Local build prerequisites** (single-platform matching your host):
+```bash
+brew install zig
+rustup target add aarch64-unknown-linux-gnu  # Apple Silicon
+rustup target add x86_64-unknown-linux-gnu   # Intel Mac
+```
+
+Once set up, only the first build is slow. Subsequent builds reuse the host cargo cache and take a few minutes.
+
+> **Note**: Multi-arch builds (`linux/amd64,linux/arm64`) always build Rust inside Docker and require `--push` to export the image (Docker cannot load multi-arch images locally).
+
+---
 
 ### Running Ibis Server on Docker
 You can follow the steps below to run the Java engine and ibis.
@@ -73,6 +103,116 @@ Run the server
 ```bash
 just run
 ```
+
+
+### Running Spark Tests Locally
+Spark-related tests require a local Spark cluster with Spark Connect enabled.
+Our GitHub CI already handles this automatically, but you must start Spark manually when running tests locally.
+
+Prerequisites
+
+- Docker & Docker Compose
+- Python dependencies installed (just install)
+- Java engine running (same as other integration tests)
+
+1. Start the Spark Cluster
+From the ibis-server directory:
+```
+cd tests/routers/v3/connector/spark
+docker compose up -d --build
+```
+Wait until Spark Connect is ready. You should see this in the logs:
+```
+docker logs spark-connect
+# Spark Connect server started
+```
+- Spark Master: spark://localhost:7077
+- Spark Connect: localhost:15002
+
+2. Run Spark Tests
+Go back to the ibis-server directory and run:
+```
+just test spark
+```
+⚠️ Spark tests will fail if the Spark cluster is not running.
+
+3. Stop the Spark Cluster (Cleanup)
+After tests finish:
+```
+cd tests/routers/v3/connector/spark
+docker compose down -v
+```
+
+
+### Running Doris Tests Locally
+Doris-related tests require a running Apache Doris instance.
+Our GitHub CI already handles this automatically, but you must start Doris manually when running tests locally.
+
+Prerequisites
+
+- Docker & Docker Compose
+- Python dependencies installed (`just install`)
+- `pymysql` installed in the dev environment (already included in dev dependencies)
+
+#### Config Doris Cluster
+
+1. Start the Doris Container
+
+From the `ibis-server` directory:
+```bash
+cd tests/routers/v3/connector/doris
+docker compose up -d
+```
+
+The container uses `apache/doris:4.0.3-all-slim` (all-in-one image with FE + BE).
+
+> ⚠️ The all-in-one Doris image requires sufficient memory (at least 8 GB recommended).
+> If you see `MEM_ALLOC_FAILED` errors, increase Docker's memory limit.
+
+Wait until Doris is healthy. Check the status:
+```bash
+mysql -h 127.0.0.1 -P 9030 -uroot -e "SHOW BACKENDS\G" | grep "Alive"
+# Alive: true
+```
+
+2. Update Connection Info (if needed)
+
+The default connection in `tests/routers/v3/connector/doris/conftest.py`:
+```python
+DORIS_HOST = "127.0.0.1"
+DORIS_PORT = 9030
+DORIS_USER = "root"
+DORIS_PASSWORD = ""
+```
+
+
+Adjust these values if your Doris instance has different credentials.
+
+If you already have a remote Doris cluster, update the connection constants in `conftest.py`:
+```python
+DORIS_HOST = "<your-doris-host>"
+DORIS_PORT = 9030
+DORIS_USER = "<user>"
+DORIS_PASSWORD = "<password>"
+```
+
+#### Run Doris Tests
+
+Go back to the `ibis-server` directory and run:
+```bash
+just test doris
+```
+
+⚠️ Doris tests will fail if the Doris instance is not reachable.
+
+#### Cleanup (Local Docker)
+
+After tests finish:
+```bash
+cd tests/routers/v3/connector/doris
+docker compose down -v
+```
+
 
 ### Start with Python Interactive Mode
 Install the dependencies

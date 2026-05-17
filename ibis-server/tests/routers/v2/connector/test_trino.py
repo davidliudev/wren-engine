@@ -128,7 +128,7 @@ async def test_query(client, manifest_str, trino: TrinoContainer):
         "1996-01-02",
         "1_370",
         "2024-01-01 23:59:59.000000",
-        "2024-01-01 23:59:59.000000",
+        "2024-01-01 23:59:59.000000 +00:00",
         None,
         "616263",
     ]
@@ -140,7 +140,7 @@ async def test_query(client, manifest_str, trino: TrinoContainer):
         "orderdate": "date32[day]",
         "order_cust_key": "string",
         "timestamp": "timestamp[ms]",
-        "timestamptz": "timestamp[ms]",
+        "timestamptz": "timestamp[ms, tz=UTC]",
         "test_null_time": "timestamp[ms]",
         "bytea_column": "binary",
     }
@@ -234,10 +234,9 @@ async def test_query_without_connection_info(client, manifest_str):
     )
     assert response.status_code == 422
     result = response.json()
-    assert result["detail"][0] is not None
-    assert result["detail"][0]["type"] == "missing"
-    assert result["detail"][0]["loc"] == ["body", "connectionInfo"]
-    assert result["detail"][0]["msg"] == "Field required"
+    assert result["errorCode"] == "INVALID_CONNECTION_INFO"
+    assert "connectionInfo" in result["message"]
+    assert "connectionFilePath" in result["message"]
 
 
 async def test_query_with_dry_run(client, manifest_str, trino: TrinoContainer):

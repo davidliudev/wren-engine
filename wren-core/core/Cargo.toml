@@ -17,6 +17,12 @@ crate-type = ["rlib", "cdylib"]
 name = "wren-cli"
 path = "src/bin/cli.rs"
 
+[features]
+default = ["multi-thread"]
+# Enable multi-threaded tokio runtime (required for sync transform_sql).
+# Disable for WASM builds where only single-threaded async is available.
+multi-thread = ["tokio/rt-multi-thread"]
+
 [dependencies]
 async-trait = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
@@ -29,16 +35,19 @@ datafusion = { workspace = true, features = [
     "regex_expressions",
     "unicode_expressions",
 ] }
+
+datafusion-session = { workspace = true }
 env_logger = { workspace = true }
+itertools = "0.14.0"
 log = { workspace = true }
 parking_lot = "0.12.3"
-petgraph = "0.7.1"
+petgraph = "0.8.2"
 petgraph-evcxr = "*"
 regex = "1.10.5"
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_with = { workspace = true }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros"] }
 wren-core-base = { workspace = true }
 
 [dev-dependencies]

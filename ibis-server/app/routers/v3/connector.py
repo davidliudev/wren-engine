@@ -1,7 +1,7 @@
 from typing import Annotated
 
 import duckdb
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.responses import ORJSONResponse
 from loguru import logger
 from opentelemetry import trace
@@ -18,6 +18,7 @@ from app.dependencies import (
     is_backward_compatible,
     verify_query_dto,
 )
+from app.mdl import knowledge
 from app.mdl.core import get_session_context
 from app.mdl.java_engine import JavaEngineConnector
 from app.mdl.rewriter import Rewriter
@@ -31,6 +32,15 @@ from app.model import (
 from app.model.connector import Connector
 from app.model.data_source import DataSource
 from app.model.error import DatabaseTimeoutError
+from app.model.metadata.metadata import Metadata
+from app.model.metadata.dto import (
+    Catalog,
+    Constraint,
+    MetadataDTO,
+    Table,
+    get_filter_info,
+)
+from app.model.metadata.factory import MetadataFactory
 from app.model.validator import Validator
 from app.query_cache import QueryCacheManager
 from app.routers import v2
@@ -39,9 +49,14 @@ from app.util import (
     append_fallback_context,
     build_context,
     execute_dry_run_with_timeout,
+    execute_get_constraints_with_timeout,
+    execute_get_schema_list_with_timeout,
+    execute_get_table_list_with_timeout,
+    execute_get_version_with_timeout,
     execute_query_with_timeout,
     execute_validate_with_timeout,
     pushdown_limit,
+    resolve_connection_info,
     safe_strtobool,
     set_attribute,
     to_json,
@@ -86,7 +101,7 @@ async def query(
     ) as span:
         set_attribute(headers, span)
         connection_info = data_source.get_connection_info(
-            dto.connection_info, dict(headers)
+            resolve_connection_info(dto), dict(headers)
         )
         # Convert headers to dict for cache manager
         headers_dict = dict(headers) if headers else None
@@ -147,33 +162,45 @@ async def query(
                 # headers for all non-hit cases
                 cache_headers[X_CACHE_HIT] = "false"
 
-                match (cache_enable, cache_hit, override_cache):
+                if cache_enable and cache_hit and override_cache:
                     # case 2: override existing cache
-                    case (True, True, True):
-                        cache_headers[X_CACHE_CREATE_AT] = str(
-                            query_cache_manager.get_cache_file_timestamp(
-                                data_source, dto.sql, connection_info, headers_dict
-                            )
+                    cache_headers[X_CACHE_CREATE_AT] = str(
+                        query_cache_manager.get_cache_file_timestamp(
+                            data_source,
+                            dto.sql,
+                            connection_info,
+                            headers_dict,
                         )
-                        query_cache_manager.set(
-                            data_source, dto.sql, result, connection_info, headers_dict
+                    )
+                    query_cache_manager.set(
+                        data_source,
+                        dto.sql,
+                        result,
+                        connection_info,
+                        headers_dict,
+                    )
+                    cache_headers[X_CACHE_OVERRIDE] = "true"
+                    cache_headers[X_CACHE_OVERRIDE_AT] = str(
+                        query_cache_manager.get_cache_file_timestamp(
+                            data_source,
+                            dto.sql,
+                            connection_info,
+                            headers_dict,
                         )
-
-                        cache_headers[X_CACHE_OVERRIDE] = "true"
-                        cache_headers[X_CACHE_OVERRIDE_AT] = str(
-                            query_cache_manager.get_cache_file_timestamp(
-                                data_source, dto.sql, connection_info, headers_dict
-                            )
-                        )
+                    )
+                elif cache_enable and not cache_hit:
                     # case 3/4: cache miss but enabled (need to create cache)
                     # no matter the cache override or not, we need to create cache
-                    case (True, False, _):
-                        query_cache_manager.set(
-                            data_source, dto.sql, result, connection_info, headers_dict
-                        )
+                    query_cache_manager.set(
+                        data_source,
+                        dto.sql,
+                        result,
+                        connection_info,
+                        headers_dict,
+                    )
+                elif not cache_enable:
                     # case 5~8 Other cases (cache is not enabled)
-                    case (False, _, _):
-                        pass
+                    pass
 
             response = ORJSONResponse(to_json(result, headers, data_source=data_source))
             update_response_headers(response, cache_headers)
@@ -340,7 +367,7 @@ async def validate(
     ) as span:
         set_attribute(headers, span)
         connection_info = data_source.get_connection_info(
-            dto.connection_info, dict(headers)
+            resolve_connection_info(dto), dict(headers)
         )
         try:
             validator = Validator(
@@ -430,6 +457,28 @@ def functions(
         return ORJSONResponse(func_list)
 
 
+@router.get(
+    "/{data_source}/function/{function_name}",
+    description="get the available function list of the specified data source",
+)
+def function(
+    data_source: DataSource,
+    function_name: str,
+    headers: Annotated[Headers, Depends(get_wren_headers)] = None,
+) -> Response:
+    span_name = f"v3_get_function_{data_source}"
+    with tracer.start_as_current_span(
+        name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
+    ) as span:
+        set_attribute(headers, span)
+        file_path = get_config().get_remote_function_list_path(data_source)
+        session_context = get_session_context(None, file_path)
+        func_list = [
+            f.to_dict() for f in session_context.get_available_function(function_name)
+        ]
+        return ORJSONResponse(func_list)
+
+
 @router.post(
     "/{data_source}/model-substitute",
     description="get the SQL which table name is substituted",
@@ -446,7 +495,7 @@ async def model_substitute(
     ) as span:
         set_attribute(headers, span)
         connection_info = data_source.get_connection_info(
-            dto.connection_info, dict(headers)
+            resolve_connection_info(dto), dict(headers)
         )
         try:
             sql = ModelSubstitute(data_source, dto.manifest_str, headers).substitute(
@@ -498,3 +547,118 @@ async def model_substitute(
                     ve,
                 )
                 raise e from None
+
+
+@router.get(
+    "/{data_source}/knowledge",
+    description="get the SQL knowledge of the specified data source",
+)
+async def get_sql_knowledge(
+    data_source: DataSource,
+):
+    knowledge_manager = knowledge.Knowledge(data_source=data_source)
+    return {
+        "text_to_sql_rule": knowledge_manager.get_text_to_sql_rule(),
+        "instructions": knowledge_manager.get_sql_instructions(),
+        "sql_correction_rule": knowledge_manager.get_sql_correction_rule(),
+    }
+
+
+@router.post(
+    "/{data_source}/metadata/tables",
+    description="get the table metadata of the specified data source",
+)
+async def get_table_list(
+    data_source: DataSource,
+    dto: MetadataDTO,
+    headers: Annotated[Headers, Depends(get_wren_headers)],
+) -> list[Table]:
+    span_name = f"v3_get_table_list_{data_source}"
+    with tracer.start_as_current_span(
+        name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
+    ) as span:
+        set_attribute(headers, span)
+        connection_info = data_source.get_connection_info(
+            resolve_connection_info(dto), dict(headers)
+        )
+        metadata = MetadataFactory.get_metadata(data_source, connection_info)
+        filter_info = get_filter_info(data_source, dto.filter_info or {})
+        return await execute_get_table_list_with_timeout(
+            metadata,
+            filter_info,
+            dto.table_limit,
+        )
+
+
+@router.post(
+    "/{data_source}/metadata/schemas",
+    description="get the schema metadata of the specified data source",
+)
+async def get_schema_list(
+    data_source: DataSource,
+    dto: MetadataDTO,
+    headers: Annotated[Headers, Depends(get_wren_headers)],
+) -> list[Catalog]:
+    span_name = f"v3_get_schema_list_{data_source}"
+    with tracer.start_as_current_span(
+        name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
+    ) as span:
+        set_attribute(headers, span)
+        connection_info = data_source.get_connection_info(
+            resolve_connection_info(dto), dict(headers)
+        )
+        metadata = MetadataFactory.get_metadata(data_source, connection_info)
+        filter_info = get_filter_info(data_source, dto.filter_info or {})
+        return await execute_get_schema_list_with_timeout(
+            metadata,
+            filter_info,
+            dto.table_limit,
+        )
+
+
+@router.post(
+    "/{data_source}/metadata/constraints",
+    response_model=list[Constraint],
+    description="get the constraints of the specified data source",
+)
+async def get_constraints(
+    data_source: DataSource,
+    dto: MetadataDTO,
+    headers: Annotated[Headers, Depends(get_wren_headers)],
+) -> list[Constraint]:
+    span_name = f"v3_metadata_constraints_{data_source}"
+    with tracer.start_as_current_span(
+        name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
+    ) as span:
+        set_attribute(headers, span)
+        connection_info = data_source.get_connection_info(
+            resolve_connection_info(dto), dict(headers)
+        )
+        metadata = MetadataFactory.get_metadata(data_source, connection_info)
+        return await execute_get_constraints_with_timeout(metadata)
+
+
+@router.post(
+    "/{data_source}/metadata/version",
+    description="get the version of the specified data source",
+)
+async def get_db_version(
+    data_source: DataSource,
+    dto: MetadataDTO,
+    headers: Annotated[Headers, Depends(get_wren_headers)],
+) -> str:
+    span_name = f"v3_metadata_version_{data_source}"
+    with tracer.start_as_current_span(
+        name=span_name, kind=trace.SpanKind.SERVER, context=build_context(headers)
+    ) as span:
+        set_attribute(headers, span)
+        connection_info = data_source.get_connection_info(
+            resolve_connection_info(dto), dict(headers)
+        )
+        metadata = MetadataFactory.get_metadata(data_source, connection_info)
+        if type(metadata).get_version is Metadata.get_version:
+            raise HTTPException(
+                status_code=501,
+                detail=f"{data_source} does not support version retrieval",
+            )
+        return await execute_get_version_with_timeout(metadata)

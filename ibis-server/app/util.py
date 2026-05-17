@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import json
 import time
 
 try:
@@ -11,6 +12,8 @@ except ImportError:  # pragma: no cover
     class ClickHouseDbError(Exception):
         pass
 
+
+import os
 
 import datafusion
 import orjson
@@ -41,7 +44,9 @@ from app.dependencies import (
     X_WREN_TIMEZONE,
 )
 from app.model.data_source import DataSource
-from app.model.error import DatabaseTimeoutError
+from app.model.error import DatabaseTimeoutError, ErrorCode, WrenError
+from app.model.metadata.bigquery import BigQueryMetadata
+from app.model.metadata.dto import FilterInfo
 from app.model.metadata.metadata import Metadata
 
 tracer = trace.get_tracer(__name__)
@@ -49,6 +54,63 @@ tracer = trace.get_tracer(__name__)
 
 MIGRATION_MESSAGE = "Wren engine is migrating to Rust version now. \
     Wren AI team are appreciate if you can provide the error messages and related logs for us."
+
+
+def _normalize_port(info: dict | None) -> dict | None:
+    if isinstance(info, dict) and type(info.get("port")) is int:
+        return {**info, "port": str(info["port"])}
+    return info
+
+
+def resolve_connection_info(dto) -> dict:
+    """Return connection info dict from either a file path or the inline DTO field.
+
+    When connectionFilePath is used, CONNECTION_FILE_ROOT must be set to the
+    directory that is allowed to be read. Requests are rejected if the env var
+    is absent or the resolved path escapes that directory.
+    """
+
+    if getattr(dto, "connection_file_path", None):
+        allowed_root = os.environ.get("CONNECTION_FILE_ROOT")
+        if not allowed_root:
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                "connectionFilePath requires the CONNECTION_FILE_ROOT environment variable to be set",
+            )
+        # Resolve the trusted root (no user input involved)
+        allowed_root_str = os.path.realpath(allowed_root)
+        # Build the candidate path by joining the trusted root with the user
+        # value, then normalise. Using os.path.normpath(os.path.join(base, user))
+        # is the pattern recognised by CodeQL as safe for path-injection checks.
+        # realpath additionally resolves symlinks so a symlink inside the allowed
+        # root cannot escape to a file outside it.
+        fullpath = os.path.realpath(
+            os.path.normpath(os.path.join(allowed_root_str, dto.connection_file_path))
+        )
+        root_prefix = (
+            allowed_root_str
+            if allowed_root_str.endswith(os.sep)
+            else allowed_root_str + os.sep
+        )
+        if not fullpath.startswith(root_prefix):
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                f"Connection file path is outside the allowed directory: {dto.connection_file_path}",
+            )
+        try:
+            with open(fullpath) as f:
+                return _normalize_port(json.load(f))
+        except FileNotFoundError:
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                f"Connection file not found: {dto.connection_file_path}",
+            )
+        except json.JSONDecodeError as e:
+            raise WrenError(
+                ErrorCode.INVALID_CONNECTION_INFO,
+                f"Invalid JSON in connection file: {e}",
+            )
+    return _normalize_port(dto.connection_info)
 
 
 @tracer.start_as_current_span("base64_to_dict", kind=trace.SpanKind.INTERNAL)
@@ -101,10 +163,10 @@ def _with_session_timezone(
                     )
                 )
                 continue
-            if data_source == DataSource.mysql:
+            if data_source in {DataSource.mysql, DataSource.doris}:
                 timezone = headers.get(X_WREN_TIMEZONE, "UTC")
                 # TODO: ibis mysql loss the timezone information
-                # we cast timestamp to timestamp with session timezone for mysql
+                # we cast timestamp to timestamp with session timezone for mysql/doris
                 fields.append(
                     pa.field(
                         field.name,
@@ -235,7 +297,7 @@ def _formater(field: pa.Field) -> str:
             return (
                 f"to_char({column_name}, '%Y-%m-%d %H:%M:%S%.6f %Z') as {column_name}"
             )
-    elif pa.types.is_binary(field.type):
+    elif pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type):
         return f"encode({column_name}, 'hex') as {column_name}"
     elif pa.types.is_interval(field.type):
         return f"cast({column_name} as varchar) as {column_name}"
@@ -350,11 +412,49 @@ async def execute_dry_run_with_timeout(connector, sql: str):
 
 async def execute_get_table_list_with_timeout(
     metadata: Metadata,
+    filter_info: FilterInfo | None = None,
+    limit: int | None = None,
 ):
     """Get the list of tables with a timeout control."""
+    if isinstance(metadata, BigQueryMetadata):
+        return await execute_with_timeout(
+            asyncio.create_task(
+                asyncio.to_thread(
+                    metadata.get_table_list,
+                    filter_info,
+                    limit,
+                )
+            ),
+            "Get Table List",
+        )
+
     return await execute_with_timeout(
         asyncio.to_thread(metadata.get_table_list),
         "Get Table List",
+    )
+
+
+async def execute_get_schema_list_with_timeout(
+    metadata: Metadata,
+    filter_info: FilterInfo | None = None,
+    limit: int | None = None,
+):
+    """Get the list of tables with a timeout control."""
+    if isinstance(metadata, BigQueryMetadata):
+        return await execute_with_timeout(
+            asyncio.create_task(
+                asyncio.to_thread(
+                    metadata.get_schema_list,
+                    filter_info,
+                    limit,
+                )
+            ),
+            "Get Schema List",
+        )
+
+    return await execute_with_timeout(
+        asyncio.to_thread(metadata.get_schema_list),
+        "Get Schema List",
     )
 
 
